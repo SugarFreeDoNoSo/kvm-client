@@ -1,0 +1,49 @@
+[package]
+name = "kvm-client"
+version = "0.1.0"
+description = "Native low-latency Luckfox PicoKVM console"
+edition = "2021"
+rust-version = "1.92"
+default-run = "kvm-client"
+
+[lib]
+name = "kvm_client"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+gtk = "0.18"
+glib = "0.21"
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-webrtc = { version = "0.24", features = ["v1_24"] }
+gstreamer-sdp = { version = "0.24", features = ["v1_24"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "input_capture"] }
+libc = "0.2"
+x11rb = { version = "0.13", features = ["xinput"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
