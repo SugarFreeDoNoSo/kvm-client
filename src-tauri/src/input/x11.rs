@@ -164,12 +164,12 @@ pub(super) fn run(shared: Arc<Shared>, generation: u64) -> Result<(), String> {
                         }
                     }
                     Event::XinputRawKeyPress(event) => {
-                        if shared.key(event.detail.saturating_sub(8), true)? {
+                        if shared.evdev_key(event.detail.saturating_sub(8), true)? {
                             break;
                         }
                     }
                     Event::XinputRawKeyRelease(event) => {
-                        shared.key(event.detail.saturating_sub(8), false)?;
+                        shared.evdev_key(event.detail.saturating_sub(8), false)?;
                     }
                     _ => {}
                 }

@@ -14,9 +14,18 @@ use gstreamer_webrtc as gst_webrtc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(target_os = "linux")]
 const BILINEAR_SHADER: &str = include_str!("shaders/bilinear.frag");
+#[cfg(target_os = "linux")]
 const SHARP_SHADER: &str = include_str!("shaders/sharp.frag");
+#[cfg(target_os = "linux")]
 const SPATIAL_VERTEX_SHADER: &str = include_str!("shaders/spatial.vert");
+#[cfg(target_os = "macos")]
+const BILINEAR_SHADER: &str = include_str!("shaders/bilinear-core.frag");
+#[cfg(target_os = "macos")]
+const SHARP_SHADER: &str = include_str!("shaders/sharp-core.frag");
+#[cfg(target_os = "macos")]
+const SPATIAL_VERTEX_SHADER: &str = include_str!("shaders/spatial-core.vert");
 const MAX_RPC_BUFFER: u64 = 32 * 1024;
 
 pub type MediaCallback = Arc<dyn Fn(MediaEvent) + Send + Sync + 'static>;
@@ -131,17 +140,21 @@ fn element(factory: &str, name: &str) -> Result<gst::Element, String> {
 }
 
 fn choose_decoder(force_software: bool) -> Result<(gst::Element, String), String> {
+    #[cfg(target_os = "linux")]
+    let hardware_factories: &[&str] = &[
+        "vah264dec",
+        "vaapih264dec",
+        "nvh264dec",
+        "v4l2slh264dec",
+        "avdec_h264",
+        "openh264dec",
+    ];
+    #[cfg(target_os = "macos")]
+    let hardware_factories: &[&str] = &["vtdec_hw", "vtdec", "avdec_h264", "openh264dec"];
     let factories: &[&str] = if force_software {
         &["avdec_h264", "openh264dec"]
     } else {
-        &[
-            "vah264dec",
-            "vaapih264dec",
-            "nvh264dec",
-            "v4l2slh264dec",
-            "avdec_h264",
-            "openh264dec",
-        ]
+        hardware_factories
     };
     for factory in factories {
         if gst::ElementFactory::find(factory).is_none() {
@@ -156,7 +169,7 @@ fn choose_decoder(force_software: bool) -> Result<(gst::Element, String), String
             return Ok((decoder, factory.to_string()));
         }
     }
-    Err("No hay un decodificador H.264. Instala gst-libav o un plugin VA compatible.".into())
+    Err("No hay un decodificador H.264 disponible. Ejecuta npm run doctor para revisar las dependencias.".into())
 }
 
 fn count_buffers(pad: &gst::Pad, counters: Arc<Counters>, decoded: bool) {
@@ -172,7 +185,7 @@ fn count_buffers(pad: &gst::Pad, counters: Arc<Counters>, decoded: bool) {
 }
 
 impl MediaEngine {
-    /// Must be constructed on the GTK main thread after GTK initialization.
+    /// Construct on the application's main thread after the native host exists.
     pub fn new(callback: MediaCallback) -> Result<Self, String> {
         gst::init().map_err(|e| format!("No se pudo iniciar GStreamer: {e}"))?;
         for required in [
@@ -185,7 +198,10 @@ impl MediaEngine {
             "glupload",
             "glcolorconvert",
             "glshader",
+            #[cfg(target_os = "linux")]
             "gtkglsink",
+            #[cfg(target_os = "macos")]
+            "glimagesinkelement",
         ] {
             if gst::ElementFactory::find(required).is_none() {
                 return Err(format!("Falta el componente GStreamer «{required}». Ejecuta npm run doctor para revisar las dependencias."));
@@ -211,7 +227,8 @@ impl MediaEngine {
         let audio_discard = element("fakesink", "kvm-audio-discard")?;
         audio_discard.set_property("sync", false);
         audio_discard.set_property("async", false);
-        let (decoder, decoder_name) = choose_decoder(false)?;
+        let force_software = std::env::var("KVM_FORCE_SOFTWARE").as_deref() == Ok("1");
+        let (decoder, decoder_name) = choose_decoder(force_software)?;
         let render_queue = element("queue", "kvm-latest-frame")?;
         render_queue.set_property("max-size-buffers", 1u32);
         render_queue.set_property("max-size-bytes", 0u32);
@@ -219,20 +236,37 @@ impl MediaEngine {
         render_queue.set_property_from_str("leaky", "downstream");
         let upload = element("glupload", "kvm-upload")?;
         let convert = element("glcolorconvert", "kvm-rgba")?;
+        #[cfg(target_os = "macos")]
+        let texture_caps = {
+            // VideoToolbox may expose rectangle textures. Our spatial shaders
+            // sample normalized 2D coordinates on every platform.
+            let filter = element("capsfilter", "kvm-texture-format")?;
+            let caps = gst::Caps::builder("video/x-raw")
+                .features(["memory:GLMemory"])
+                .field("format", "RGBA")
+                .field("texture-target", "2D")
+                .build();
+            filter.set_property("caps", &caps);
+            filter
+        };
         let shader = element("glshader", "kvm-spatial-filter")?;
         // Supply both shader stages. glshader's generated vertex stage can use
         // a newer GLSL version in WebKit's shared GL context, which cannot link
         // with our portable legacy/GLES fragment stages.
         shader.set_property("vertex", SPATIAL_VERTEX_SHADER);
         shader.set_property("fragment", BILINEAR_SHADER);
+        #[cfg(target_os = "linux")]
         let sink = element("gtkglsink", "kvm-screen")?;
+        #[cfg(target_os = "macos")]
+        let sink = element("glimagesinkelement", "kvm-screen")?;
         sink.set_property("sync", false);
         sink.set_property("async", false);
         sink.set_property("force-aspect-ratio", true);
         sink.set_property("enable-last-sample", false);
         // Read on this thread so GTK creates its widget on the main thread.
+        #[cfg(target_os = "linux")]
         let _: glib::Object = sink.property("widget");
-        let nodes = [
+        let nodes = vec![
             &webrtc,
             &incoming,
             &depay,
@@ -246,7 +280,9 @@ impl MediaEngine {
             &audio_discard,
         ];
         pipeline.add_many(nodes).map_err(|e| e.to_string())?;
-        gst::Element::link_many([
+        #[cfg(target_os = "macos")]
+        pipeline.add(&texture_caps).map_err(|e| e.to_string())?;
+        let mut video_nodes = vec![
             &incoming,
             &depay,
             &parser,
@@ -254,10 +290,12 @@ impl MediaEngine {
             &render_queue,
             &upload,
             &convert,
-            &shader,
-            &sink,
-        ])
-        .map_err(|e| format!("No se pudo enlazar el receptor H.264: {e}"))?;
+        ];
+        #[cfg(target_os = "macos")]
+        video_nodes.push(&texture_caps);
+        video_nodes.extend([&shader, &sink]);
+        gst::Element::link_many(video_nodes)
+            .map_err(|e| format!("No se pudo enlazar el receptor H.264: {e}"))?;
 
         let counters = Arc::new(Counters::default());
         count_buffers(
@@ -392,9 +430,31 @@ impl MediaEngine {
 
     /// Borrowed GtkWidget pointer, owned by the sink. GTK main thread only.
     /// Keep a gtk::Widget reference in the view while the engine is alive.
+    #[cfg(target_os = "linux")]
     pub fn widget_ptr(&self) -> usize {
         let widget: glib::Object = self.0.sink.property("widget");
         widget.as_ptr() as usize
+    }
+
+    /// The host retains this NSView until the pipeline has reached NULL.
+    /// Call on the AppKit main thread before starting the pipeline.
+    #[cfg(target_os = "macos")]
+    pub fn set_window_handle(&self, handle: usize) -> Result<(), String> {
+        use gstreamer_video::prelude::*;
+        if handle == 0 {
+            return Err("No se creó la superficie nativa de video".into());
+        }
+        let overlay = self
+            .0
+            .sink
+            .clone()
+            .dynamic_cast::<gstreamer_video::VideoOverlay>()
+            .map_err(|_| "El sink de video no admite una superficie nativa")?;
+        // SAFETY: video_host owns a retained NSView on the main thread and
+        // keeps it alive through shutdown. No AppKit object crosses to JS.
+        unsafe { overlay.set_window_handle(handle) };
+        overlay.handle_events(false);
+        Ok(())
     }
 
     /// Called once signaling is ready to accept Offer and Ice events.
@@ -679,6 +739,9 @@ impl MediaEngine {
                                 .src()
                                 .map(|s| s.name().to_string())
                                 .unwrap_or_default();
+                            // Avoid dumping raw debug/SDP, which may contain
+                            // ephemeral ICE credentials. Keep element context.
+                            eprintln!("GStreamer error ({source}): {}", error.error());
                             (inner.callback)(MediaEvent::Error(format!(
                                 "Video ({source}): {}",
                                 error.error()
@@ -687,6 +750,13 @@ impl MediaEngine {
                     }
                     gst::MessageView::Eos(_) => {
                         (inner.callback)(MediaEvent::State("disconnected".into()));
+                    }
+                    gst::MessageView::Warning(warning) => {
+                        let source = warning
+                            .src()
+                            .map(|s| s.name().to_string())
+                            .unwrap_or_default();
+                        eprintln!("GStreamer warning ({source}): {}", warning.error());
                     }
                     _ => {}
                 }
@@ -746,6 +816,13 @@ impl MediaEngine {
             }
             gst::PadProbeReturn::Remove
         });
+    }
+
+    /// Monotonic decoded/presented counters, independent of FPS sampling.
+    pub fn frame_counts(&self) -> (u64, u64) {
+        let decoded = self.0.counters.decoded.load(Ordering::Relaxed);
+        let sink_stats = self.0.sink.property::<gst::Structure>("stats");
+        (decoded, sink_stats.get::<u64>("rendered").unwrap_or(0))
     }
 
     pub fn stats(&self) -> MediaStats {

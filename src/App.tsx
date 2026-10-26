@@ -5,8 +5,10 @@ import {
 } from "./backend";
 
 const defaultAddress = "https://192.168.100.8/";
+const isMac = /Mac/.test(navigator.platform);
 const initialStatus: AppStatus = {
   state: "disconnected", message: "Listo para conectar", address: defaultAddress,
+  phase: "idle", videoState: "waiting",
   capture: false, captureRequested: false, inputBackend: "", decoder: "",
 };
 
@@ -41,9 +43,18 @@ export default function App() {
   const [fullscreen, setFullscreen] = useState(false);
   const active = status.state === "connected";
   const connecting = status.state === "connecting";
-  const locked = busy || connecting;
+  const locked = busy || connecting || settingsBusy;
   const mounted = useRef(true);
   const statusRevision = useRef(0);
+  const operationInFlight = useRef(false);
+  const wasCaptured = useRef(false);
+
+  useEffect(() => {
+    if (fullscreen && wasCaptured.current && !status.capture) {
+      void call("set_fullscreen", { enabled: false }).then(() => setFullscreen(false)).catch((reason) => setError(errorMessage(reason)));
+    }
+    wasCaptured.current = status.capture;
+  }, [fullscreen, status.capture]);
 
   useEffect(() => {
     mounted.current = true;
@@ -52,12 +63,17 @@ export default function App() {
     let cancelled = false;
     let receivedStatus = false;
     void onEvent<AppStatus>("kvm://status", (next) => {
+      if (cancelled) return;
       receivedStatus = true;
       statusRevision.current += 1;
-      if (!cancelled) {
-        setStatus(next);
-        if (next.state === "disconnected" || next.state === "error") setMetrics(null);
-      }
+      setStatus(next);
+      setError("");
+      if (next.state === "disconnected" || next.state === "error") setMetrics(null);
+    }).then((stop) => cancelled ? stop() : unsubscribe.push(stop)).catch((reason) => {
+      if (!cancelled) setError(errorMessage(reason));
+    });
+    void onEvent<boolean>("kvm://fullscreen", (enabled) => {
+      if (!cancelled) setFullscreen(enabled);
     }).then((stop) => cancelled ? stop() : unsubscribe.push(stop)).catch((reason) => {
       if (!cancelled) setError(errorMessage(reason));
     });
@@ -94,7 +110,8 @@ export default function App() {
 
   async function onConnect(event: FormEvent) {
     event.preventDefault();
-    if (!address.trim() || locked || !nativeAvailable) return;
+    if (!address.trim() || locked || operationInFlight.current || !nativeAvailable) return;
+    operationInFlight.current = true;
     setError("");
     setBusy(true);
     try {
@@ -107,12 +124,14 @@ export default function App() {
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
+      operationInFlight.current = false;
       setBusy(false);
     }
   }
 
   async function acceptCertificate() {
-    if (!inspection || busy) return;
+    if (!inspection || operationInFlight.current) return;
+    operationInFlight.current = true;
     setBusy(true);
     setError("");
     try {
@@ -123,12 +142,14 @@ export default function App() {
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
+      operationInFlight.current = false;
       setBusy(false);
     }
   }
 
   async function action(command: string, args?: Record<string, unknown>) {
-    if (busy) return;
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
     setBusy(true);
     setError("");
     try {
@@ -137,11 +158,14 @@ export default function App() {
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
+      operationInFlight.current = false;
       setBusy(false);
     }
   }
 
   async function updateInput(next: InputSettings) {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
     setSettingsBusy(true);
     setError("");
     try {
@@ -151,11 +175,14 @@ export default function App() {
       setSensitivityDraft(String(input.sensitivity));
       setError(errorMessage(reason));
     } finally {
+      operationInFlight.current = false;
       setSettingsBusy(false);
     }
   }
 
   async function updateVideo(next: VideoSettings) {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
     setSettingsBusy(true);
     setError("");
     try {
@@ -164,6 +191,7 @@ export default function App() {
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
+      operationInFlight.current = false;
       setSettingsBusy(false);
     }
   }
@@ -178,7 +206,11 @@ export default function App() {
     }
   }
 
-  const statusText = !nativeAvailable ? "Vista previa · abre la aplicación de escritorio para conectar" : error || status.message || "Listo para conectar";
+  const nativeError = status.state === "error";
+  const statusText = !nativeAvailable ? "Vista previa · abre la aplicación de escritorio para conectar" : nativeError ? status.message : error || status.message || "Listo para conectar";
+  const phaseText = { idle: "", tls: "TLS", auth: "Autenticación", signaling: "Señalización", webrtc: "WebRTC", ready: nativeError ? "Sesión interrumpida" : "Canal conectado" }[status.phase];
+  const videoText = active ? { waiting: "Esperando video", playing: "Video activo", no_signal: "Sin señal HDMI", stalled: "Video detenido" }[status.videoState] : "";
+  const captureHint = isMac ? "macOS · captura en esta ventana; Ctrl+Option+Esc libera" : /X11|XInput/.test(status.inputBackend) ? "X11 · captura en la ventana enfocada; Ctrl+Alt+Esc libera" : "Wayland: autoriza el portal y cruza el borde derecho; Ctrl+Alt+Esc libera";
 
   return (
     <>
@@ -194,8 +226,8 @@ export default function App() {
             {!nativeAvailable ? "VISTA PREVIA" : active ? "EN LÍNEA" : connecting ? "CONECTANDO" : status.state === "error" ? "SIN CONEXIÓN" : "DESCONECTADO"}
           </div>
           <div className="topbar-actions">
-            <span className="shortcut"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Esc</kbd><span>liberar control</span></span>
-            <button className="icon-button" type="button" title={fullscreen ? "Salir de pantalla completa" : "Pantalla completa"} aria-label={fullscreen ? "Salir de pantalla completa" : "Pantalla completa"} onClick={() => void toggleFullscreen()} disabled={!nativeAvailable}><Icon name="expand" /></button>
+            <span className="shortcut"><kbd>Ctrl</kbd><kbd>{isMac ? "Option" : "Alt"}</kbd><kbd>Esc</kbd><span>liberar control</span></span>
+            <button className="icon-button" type="button" title={fullscreen ? "Salir de pantalla completa" : "Pantalla completa · oculta la barra; libera el control para volver"} aria-label={fullscreen ? "Salir de pantalla completa" : "Pantalla completa"} onClick={() => void toggleFullscreen()} disabled={!nativeAvailable}><Icon name="expand" /></button>
           </div>
         </header>
 
@@ -203,11 +235,11 @@ export default function App() {
           <label className="field address-field"><span>DISPOSITIVO</span><div className="address-input"><span className="protocol-dot" /><input aria-label="Dirección del KVM" type="url" value={address} onChange={(event) => setAddress(event.target.value)} placeholder={defaultAddress} spellCheck={false} autoCapitalize="none" autoCorrect="off" required disabled={active || locked} /></div></label>
           <label className="field password-field"><span>CONTRASEÑA LOCAL</span><input aria-label="Contraseña local" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Si el dispositivo la requiere" autoComplete="off" disabled={active || locked} /></label>
           {active || connecting ? (
-            <button type="button" className="button disconnect" onClick={() => void action("disconnect_device")} disabled={busy}><Icon name="connect" />Desconectar</button>
+            <button type="button" className="button disconnect" onClick={() => void action("disconnect_device")} disabled={busy || settingsBusy}><Icon name="connect" />Desconectar</button>
           ) : (
             <button type="submit" className="button primary" disabled={locked || !nativeAvailable || !address.trim()}><Icon name="connect" />{busy ? "Verificando…" : "Conectar"}</button>
           )}
-          <button type="button" className={`button capture ${status.capture ? "captured" : ""}`} onClick={() => void action("set_capture", { enabled: !status.captureRequested })} disabled={!active || busy}><Icon name="mouse" />{status.capture ? "Liberar control" : status.captureRequested ? "Cancelar captura" : "Capturar control"}</button>
+          <button type="button" className={`button capture ${status.capture ? "captured" : ""}`} title={captureHint} onClick={() => void action("set_capture", { enabled: !status.captureRequested })} disabled={!active || busy || settingsBusy}><Icon name="mouse" />{status.capture ? "Liberar control" : status.captureRequested ? "Cancelar captura" : "Capturar control"}</button>
         </form>
 
         <section className="settings-row" aria-label="Ajustes de transmisión">
@@ -240,17 +272,17 @@ export default function App() {
           <div className="metric"><span>RTT</span><strong>{metric(metrics?.rttMs, 1)}<em>ms</em></strong></div>
           <div className="metric"><span>PÉRDIDAS</span><strong>{metric(metrics?.packetsLost)}</strong></div>
           <div className={`metric queue-metric ${metrics?.congested ? "warning" : ""}`}><span>COLA</span><strong>{metric(metrics?.queueDepth)}{metrics?.congested && <em>congestión</em>}</strong></div>
-          <div className="engine-info"><span>{status.inputBackend || "Entrada nativa"}</span><span>{status.decoder || "Video nativo · WebRTC"}</span></div>
+          <div className="engine-info"><span title={captureHint}>{status.inputBackend || (isMac ? "Entrada nativa · macOS" : "Entrada nativa")}</span><span className="video-state" data-state={active ? status.videoState : "waiting"} title={[videoText, status.decoder].filter(Boolean).join(" · ")}>{videoText || status.decoder || "Video nativo · WebRTC"}{videoText && status.decoder ? ` · ${status.decoder}` : ""}</span></div>
         </section>
 
         <footer className={`statusbar ${error || status.state === "error" ? "has-error" : ""}`}>
           <span className="status-message" role="status" title={statusText}><span className="status-square" />{statusText}</span>
-          <span className="status-note">{status.capture ? "CONTROL CAPTURADO" : "1:1 · SIN PREDICCIÓN"}</span>
-          {error && <button type="button" className="dismiss-error" onClick={() => setError("")} aria-label="Cerrar mensaje de error"><Icon name="close" size={12} /></button>}
+          <span className="status-note">{status.capture ? "CONTROL CAPTURADO" : phaseText || "1:1 · SIN PREDICCIÓN"}</span>
+          {error && !nativeError && <button type="button" className="dismiss-error" onClick={() => setError("")} aria-label="Cerrar mensaje de error"><Icon name="close" size={12} /></button>}
         </footer>
       </main>
 
-      {!nativeAvailable && <div className="browser-placeholder"><div className="placeholder-crosshair" aria-hidden="true">+</div><h1>Tu pantalla remota, directamente.</h1><p>El video y la captura del mouse se ejecutan en el motor nativo.</p><code>npm run tauri dev</code><span>Esta vista previa no abre conexiones al dispositivo.</span></div>}
+      {!nativeAvailable && <div className="browser-placeholder"><div className="placeholder-crosshair" aria-hidden="true">+</div><h1>Tu pantalla remota, directamente.</h1><p>El video y la captura del mouse se ejecutan en el motor nativo.</p><code>npm run desktop</code><span>Esta vista previa no abre conexiones al dispositivo.</span></div>}
 
       {inspection && <div className="trust-backdrop"><section className="trust-dialog" role="dialog" aria-modal="true" aria-labelledby="trust-title" aria-describedby="trust-description">
         <div className="trust-heading"><span className="trust-icon"><Icon name="shield" size={22} /></span><div><h2 id="trust-title">Verificar este dispositivo</h2><p id="trust-description">Confirma la huella del certificado antes de enviar tu contraseña.</p></div></div>

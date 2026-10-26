@@ -2,9 +2,13 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
+export type ConnectionPhase = "idle" | "tls" | "auth" | "signaling" | "webrtc" | "ready";
+export type VideoState = "waiting" | "playing" | "no_signal" | "stalled";
 
 export interface AppStatus {
   state: ConnectionState;
+  phase: ConnectionPhase;
+  videoState: VideoState;
   message: string;
   address: string;
   capture: boolean;

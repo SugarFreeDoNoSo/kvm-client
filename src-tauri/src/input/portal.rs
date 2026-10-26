@@ -94,7 +94,7 @@ pub(super) async fn run(shared: Arc<Shared>, generation: u64) -> Result<(), Stri
                             ei::Event::Button(bit,pressed)=>shared.button(bit,pressed)?,
                             ei::Event::Wheel(steps)=>shared.wheel(steps)?,
                             ei::Event::Key(code,pressed)=>{
-                                if shared.key(code,pressed)?{return Ok(());}
+                                if shared.evdev_key(code,pressed)?{return Ok(());}
                             }
                             ei::Event::Stopped=>{shared.release();}
                         }

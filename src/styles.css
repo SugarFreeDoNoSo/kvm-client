@@ -533,6 +533,14 @@ kbd {
   max-width:205px;
 }
 
+.video-state[data-state=playing] {
+  color:#9fbf94;
+}
+
+.video-state[data-state=no_signal],.video-state[data-state=stalled] {
+  color:#e7c486;
+}
+
 .statusbar {
   flex:1;
   min-height:25px;

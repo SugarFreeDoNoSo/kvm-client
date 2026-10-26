@@ -50,7 +50,9 @@ pub struct Scheduler {
     fraction_y: f64,
     wheel_fraction: f64,
     buttons: u8,
-    pressed: BTreeSet<u32>,
+    // USB HID usages, including modifier usages 0xe0..=0xe7. Backends
+    // normalize their platform key codes before entering the shared scheduler.
+    pressed: BTreeSet<u8>,
 }
 
 fn rpc(method: &str, params: Value) -> Value {
@@ -164,7 +166,7 @@ impl Scheduler {
     }
 
     /// Returns true for the local emergency-release shortcut; Escape is never sent.
-    pub fn key(&mut self, code: u32, down: bool) -> Result<bool, String> {
+    pub fn key(&mut self, code: u8, down: bool) -> Result<bool, String> {
         let mut pressed = self.pressed.clone();
         if down {
             pressed.insert(code);
@@ -172,9 +174,9 @@ impl Scheduler {
             pressed.remove(&code);
         }
         if down
-            && code == 1
-            && (pressed.contains(&29) || pressed.contains(&97))
-            && (pressed.contains(&56) || pressed.contains(&100))
+            && code == 41
+            && (pressed.contains(&224) || pressed.contains(&228))
+            && (pressed.contains(&226) || pressed.contains(&230))
         {
             return Ok(true);
         }
@@ -184,7 +186,8 @@ impl Scheduler {
         let modifier = pressed.iter().fold(0, |mods, code| mods | modifier(*code));
         let mut keys: Vec<u8> = pressed
             .iter()
-            .filter_map(|code| evdev_to_hid(*code))
+            .copied()
+            .filter(|code| !(224..=231).contains(code))
             .collect();
         keys.sort_unstable();
         keys.dedup();
@@ -252,21 +255,16 @@ impl Scheduler {
     }
 }
 
-fn modifier(code: u32) -> u8 {
-    match code {
-        29 => 1,
-        42 => 2,
-        56 => 4,
-        125 => 8,
-        97 => 16,
-        54 => 32,
-        100 => 64,
-        126 => 128,
-        _ => 0,
+fn modifier(code: u8) -> u8 {
+    if (224..=231).contains(&code) {
+        1 << (code - 224)
+    } else {
+        0
     }
 }
 
 /// Physical Linux evdev positions to USB HID usage IDs (independent of layout).
+#[cfg(any(target_os = "linux", test))]
 pub fn evdev_to_hid(code: u32) -> Option<u8> {
     Some(match code {
         1 => 41,
@@ -289,6 +287,7 @@ pub fn evdev_to_hid(code: u32) -> Option<u8> {
         26 => 47,
         27 => 48,
         28 => 40,
+        29 => 224,
         30 => 4,
         31 => 22,
         32 => 7,
@@ -301,6 +300,7 @@ pub fn evdev_to_hid(code: u32) -> Option<u8> {
         39 => 51,
         40 => 52,
         41 => 53,
+        42 => 225,
         43 => 49,
         44 => 29,
         45 => 27,
@@ -312,7 +312,9 @@ pub fn evdev_to_hid(code: u32) -> Option<u8> {
         51 => 54,
         52 => 55,
         53 => 56,
+        54 => 229,
         55 => 85,
+        56 => 226,
         57 => 44,
         58 => 57,
         59..=68 => (code - 1) as u8,
@@ -335,8 +337,10 @@ pub fn evdev_to_hid(code: u32) -> Option<u8> {
         87 => 68,
         88 => 69,
         96 => 88,
+        97 => 228,
         98 => 84,
         99 => 70,
+        100 => 230,
         102 => 74,
         103 => 82,
         104 => 75,
@@ -348,6 +352,8 @@ pub fn evdev_to_hid(code: u32) -> Option<u8> {
         110 => 73,
         111 => 76,
         119 => 72,
+        125 => 227,
+        126 => 231,
         127 => 101,
         183..=194 => (code - 79) as u8,
         _ => return None,
@@ -456,12 +462,54 @@ mod tests {
     #[test]
     fn emergency_shortcut_is_local_and_release_resets_modifiers() {
         let mut s = Scheduler::default();
-        s.key(29, true).unwrap();
-        s.key(56, true).unwrap();
-        assert!(s.key(1, true).unwrap());
+        s.key(224, true).unwrap();
+        s.key(226, true).unwrap();
+        assert!(s.key(41, true).unwrap());
         s.release();
         let r = drain(&mut s);
         assert_eq!(r[1]["params"]["modifier"], 0);
         assert!(r.iter().all(|v| v["params"]["keys"] != json!([41])));
+    }
+
+    #[test]
+    fn normalized_hid_preserves_both_modifier_sides_and_boot_rollover() {
+        let mut s = Scheduler::default();
+        for code in 224..=231 {
+            s.key(code, true).unwrap();
+        }
+        let reports = drain(&mut s);
+        assert_eq!(reports.last().unwrap()["params"]["modifier"], 255);
+        assert_eq!(reports.last().unwrap()["params"]["keys"], json!([]));
+        for code in 4..=10 {
+            s.key(code, true).unwrap();
+        }
+        assert_eq!(
+            drain(&mut s).last().unwrap()["params"]["keys"],
+            json!(vec![1; 6])
+        );
+        s.key(10, false).unwrap();
+        assert_eq!(
+            drain(&mut s)[0]["params"]["keys"],
+            json!([4, 5, 6, 7, 8, 9])
+        );
+    }
+
+    #[test]
+    fn linux_codes_normalize_to_physical_hid_usages() {
+        assert_eq!(evdev_to_hid(30), Some(4));
+        assert_eq!(evdev_to_hid(1), Some(41));
+        for (code, usage) in [
+            (29, 224),
+            (42, 225),
+            (56, 226),
+            (125, 227),
+            (97, 228),
+            (54, 229),
+            (100, 230),
+            (126, 231),
+        ] {
+            assert_eq!(evdev_to_hid(code), Some(usage));
+        }
+        assert_eq!(evdev_to_hid(u32::MAX), None);
     }
 }

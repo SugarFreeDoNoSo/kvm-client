@@ -3,6 +3,25 @@
 El mouse y el teclado se capturan en Rust. Ningún evento individual atraviesa
 React ni depende de `requestAnimationFrame`.
 
+## Uso en macOS
+
+1. Conecta el KVM, enfoca la ventana de la aplicación y activa **Capturar control**.
+2. El mouse y el teclado se procesan en el backend nativo; la captura queda limitada a la ventana enfocada.
+3. Pulsa **Ctrl+Option+Esc** para liberar el control. También se libera al cambiar de aplicación, desconectar o cerrar la ventana.
+
+El backend `macOS · AppKit` no solicita permisos de Accesibilidad ni de
+Monitorización de entrada: utiliza un monitor local de eventos de la aplicación.
+No se captura entrada global ni se envían eventos de otras aplicaciones. Los
+códigos físicos se traducen a los usos USB HID del planificador compartido;
+Command se envía como GUI y Option como Alt. El equipo remoto aplica su propia
+distribución. Fn por sí sola no se transmite; las teclas de función se reciben
+cuando macOS las entrega como F1–F20.
+
+Al capturar se oculta y desacopla el cursor. Se restauran el cursor y los ajustes
+de eventos al liberar, incluso ante errores. La rueda conserva los incrementos
+fraccionales del trackpad y respeta su dirección configurada. La validación
+física de esta ruta se registra por separado en `verification.md`.
+
 ## Uso en Wayland
 
 1. Conecta el KVM y activa **Capturar**.
@@ -62,7 +81,7 @@ El contador de Hz mide reportes aceptados por el transporte por segundo, incluid
 los reportes de teclado y rueda. Con el mouse quieto puede ser cero. No mide el
 polling USB ni garantiza la misma tasa en el equipo remoto.
 
-Los códigos físicos evdev se traducen a usos USB HID, con modificadores izquierdo
+Los códigos físicos de cada plataforma se traducen a usos USB HID, con modificadores izquierdo
 y derecho separados. El teclado sigue el límite de seis teclas simultáneas de un
 teclado USB boot; el exceso usa `ErrorRollOver`. El host remoto aplica su propia
 distribución de teclado.

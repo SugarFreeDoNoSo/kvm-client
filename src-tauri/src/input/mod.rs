@@ -1,12 +1,24 @@
 //! Native input is captured and scheduled without crossing the JavaScript bridge.
+#[cfg(target_os = "linux")]
 mod ei;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
 mod portal;
 #[cfg(test)]
 mod runtime_tests;
 mod scheduler;
+#[cfg(target_os = "linux")]
 mod x11;
 
 pub use scheduler::InputSettings;
+
+/// Exercises the AppKit capture lifecycle with an isolated in-memory HID
+/// transport. This diagnostic never creates a device or network connection.
+#[cfg(target_os = "macos")]
+pub(crate) async fn self_test(window: tauri::WebviewWindow) -> Result<(), String> {
+    macos::self_test(window).await
+}
 
 use scheduler::Scheduler;
 use serde::Serialize;
@@ -22,6 +34,8 @@ use std::{
 
 pub type RpcSender = Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync>;
 pub type CaptureCallback = Arc<dyn Fn(CaptureStatus) + Send + Sync>;
+#[cfg(target_os = "macos")]
+type NativeDispatch = Arc<dyn Fn(bool, u64) -> Result<(), String> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CaptureStatus {
@@ -48,6 +62,8 @@ pub(super) struct Shared {
     requested: AtomicBool,
     active: AtomicBool,
     stats: Mutex<InputStats>,
+    #[cfg(target_os = "macos")]
+    native_dispatch: Mutex<Option<NativeDispatch>>,
 }
 
 impl Shared {
@@ -87,11 +103,42 @@ impl Shared {
             .wheel(steps)
     }
 
-    pub(super) fn key(&self, code: u32, pressed: bool) -> Result<bool, String> {
+    pub(super) fn key(&self, usage: u8, pressed: bool) -> Result<bool, String> {
         self.scheduler
             .lock()
             .map_err(|e| e.to_string())?
-            .key(code, pressed)
+            .key(usage, pressed)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn evdev_key(&self, code: u32, pressed: bool) -> Result<bool, String> {
+        match scheduler::evdev_to_hid(code) {
+            Some(usage) => self.key(usage, pressed),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dispatch_native(&self, enabled: bool, generation: u64) -> Result<(), String> {
+        let dispatch = self
+            .native_dispatch
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone();
+        match dispatch {
+            Some(dispatch) => dispatch(enabled, generation),
+            None if !enabled => Ok(()),
+            None => Err("La captura macOS todavía no se ha inicializado".into()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_native(&self, message: impl Into<String>) {
+        self.requested.store(false, Ordering::Release);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.release();
+        self.report(false, "macOS · AppKit", message);
+        let _ = self.dispatch_native(false, generation);
     }
 
     pub(super) fn release(&self) {
@@ -104,6 +151,9 @@ impl Shared {
 #[derive(Clone)]
 pub struct InputEngine {
     shared: Arc<Shared>,
+    // Capture workers hold Shared as well. Count engine handles independently so
+    // dropping the final owner also cancels a worker that is still capturing.
+    owners: Arc<()>,
 }
 
 impl InputEngine {
@@ -119,6 +169,8 @@ impl InputEngine {
                 target_hz: 125,
                 ..Default::default()
             }),
+            #[cfg(target_os = "macos")]
+            native_dispatch: Mutex::new(None),
         });
         let weak = Arc::downgrade(&shared);
         thread::Builder::new()
@@ -182,11 +234,15 @@ impl InputEngine {
                     let stalled = blocked_since
                         .is_some_and(|since| since.elapsed() > Duration::from_millis(250))
                         && shared.active.load(Ordering::Acquire);
-                    if stalled {
+                    let stalled_generation = if stalled {
+                        let generation = shared.generation.load(Ordering::Acquire);
                         shared.requested.store(false, Ordering::Release);
                         scheduler.release();
                         blocked_since = None;
-                    }
+                        Some(generation)
+                    } else {
+                        None
+                    };
                     if let Ok(mut stats) = shared.stats.lock() {
                         stats.target_hz = hz;
                         stats.queue_depth = scheduler.len();
@@ -198,7 +254,13 @@ impl InputEngine {
                         }
                     }
                     drop(scheduler);
-                    if stalled {
+                    if let Some(generation) = stalled_generation.filter(|generation| {
+                        shared.generation.load(Ordering::Acquire) == *generation
+                    }) {
+                        #[cfg(target_os = "macos")]
+                        let _ = shared.dispatch_native(false, generation);
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = generation;
                         shared.report(
                             false,
                             "",
@@ -217,7 +279,15 @@ impl InputEngine {
                 }
             })
             .expect("failed to start input scheduler");
-        Self { shared }
+        Self {
+            shared,
+            owners: Arc::new(()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn initialize_macos(&self, window: tauri::WebviewWindow) -> Result<(), String> {
+        macos::initialize(&self.shared, window)
     }
 
     pub fn set_settings(&self, settings: InputSettings) -> Result<(), String> {
@@ -246,16 +316,48 @@ impl InputEngine {
     pub fn capture(&self, enabled: bool) -> Result<(), String> {
         if !enabled {
             self.shared.requested.store(false, Ordering::Release);
-            self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            #[cfg(target_os = "macos")]
+            let native_result = self.shared.dispatch_native(false, generation);
+            #[cfg(not(target_os = "macos"))]
+            let _ = generation;
             self.release_all();
             self.shared
                 .report(false, "", "Control local; captura liberada");
+            #[cfg(target_os = "macos")]
+            return native_result;
+            #[cfg(not(target_os = "macos"))]
             return Ok(());
         }
         if self.shared.requested.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(target_os = "macos")]
+        {
+            self.shared
+                .report(false, "macOS · AppKit", "Preparando captura nativa…");
+            return self
+                .shared
+                .dispatch_native(true, generation)
+                .inspect_err(|_| {
+                    self.shared.requested.store(false, Ordering::Release);
+                });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.capture_linux(generation)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = generation;
+            self.shared.requested.store(false, Ordering::Release);
+            Err("La captura nativa sólo está disponible en Linux y macOS".into())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_linux(&self, generation: u64) -> Result<(), String> {
         let shared = self.shared.clone();
         let force_x11 = std::env::var("KVM_INPUT_BACKEND").as_deref() == Ok("x11");
         let wayland = !force_x11
@@ -324,5 +426,20 @@ impl InputEngine {
             }
             scheduler.acknowledge();
         }
+    }
+}
+
+impl Drop for InputEngine {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.owners) != 1 {
+            return;
+        }
+        self.shared.requested.store(false, Ordering::Release);
+        let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared.release();
+        #[cfg(target_os = "macos")]
+        let _ = self.shared.dispatch_native(false, generation);
+        #[cfg(not(target_os = "macos"))]
+        let _ = generation;
     }
 }
