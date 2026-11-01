@@ -13,7 +13,7 @@ export class MobileSession {
   private signals = Promise.resolve();
   private timeout?: ReturnType<typeof setTimeout>;
 
-  constructor(private state: (message: string, ready: boolean) => void, private failure: (error: unknown) => void, private warning: (message: string) => void) {}
+  constructor(private state: (message: string, ready: boolean) => void, private failure: (error: unknown) => void, private warning: (message: string) => void, private keyboardHidden: () => void) {}
 
   private native(action: string, args: Record<string, unknown> = {}) {
     return invoke("plugin:kvm-mobile|execute", { action, session: this.id, ...args });
@@ -29,6 +29,7 @@ export class MobileSession {
           this.state("Conectado · desliza para mover; doble toque para clic", true);
         } else if (event.kind === "error") throw new Error(event.data);
         else if (event.kind === "warning") this.warning(event.data);
+        else if (event.kind === "keyboardHidden") this.keyboardHidden();
         else if (event.kind === "offer") {
           const bytes = new TextEncoder().encode(JSON.stringify({ type: "offer", sdp: event.data }));
           await this.signal({ type: "offer", data: { sd: btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join("")) } });

@@ -78,7 +78,7 @@ export default function MobileApp() {
       }, (reason) => {
         if (!mounted.current) return;
         setError(errorMessage(reason)); setReady(false); setKeyboard(false); setMessage("Conexión interrumpida"); setPanel(true);
-      }, setError);
+      }, setError, () => setKeyboard(false));
       session.current = next;
       await next.connect(target, password);
       if (mounted.current) setPassword("");

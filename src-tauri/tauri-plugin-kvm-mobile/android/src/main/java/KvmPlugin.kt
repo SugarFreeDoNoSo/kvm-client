@@ -2,6 +2,7 @@ package local.kvm.mobile
 
 import android.app.Activity
 import android.graphics.Color
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.*
@@ -273,7 +274,18 @@ class KvmPlugin(private val activity: Activity) : Plugin(activity) {
 
     inner class InputSurface : FrameLayout(activity) {
         val trackpad = Trackpad(::move, ::click)
+        private var imeWasVisible = false
+        private val keyboardLayout = ViewTreeObserver.OnGlobalLayoutListener {
+            val frame = Rect()
+            activity.window.decorView.getWindowVisibleDisplayFrame(frame)
+            val rootHeight = activity.window.decorView.height
+            val visible = rootHeight - frame.bottom > rootHeight * 0.18
+            if (imeWasVisible && !visible) event("keyboardHidden")
+            imeWasVisible = visible
+        }
         init { isFocusable = true; isFocusableInTouchMode = true; setBackgroundColor(Color.BLACK) }
+        override fun onAttachedToWindow() { super.onAttachedToWindow(); viewTreeObserver.addOnGlobalLayoutListener(keyboardLayout) }
+        override fun onDetachedFromWindow() { viewTreeObserver.removeOnGlobalLayoutListener(keyboardLayout); super.onDetachedFromWindow() }
         override fun onInterceptTouchEvent(event: MotionEvent) = true
         override fun onTouchEvent(event: MotionEvent): Boolean {
             val density = resources.displayMetrics.density.toDouble()
