@@ -179,3 +179,38 @@ La lectura OpenGL a PNG en macOS compiló los cuatro shaders principales con tre
 ### Paquete de distribución v0.1.0
 
 La suite final pasó con 69 pruebas y una ignorada, incluyendo dos pruebas de resolución del runtime privado. Tauri produjo una aplicación arm64 con mínimo macOS 26.0, calculado también sobre las bibliotecas incorporadas: 66 Mach-O y 19 plugins, sin dependencias externas salvo las bibliotecas Apple. Se verificaron las firmas ad hoc con `codesign --verify --deep --strict`, el DMG con `hdiutil verify` y el ZIP extrayéndolo en un directorio nuevo. Desde esa extracción, `--check-runtime` pasó con un registro GStreamer nuevo y sin rutas multimedia heredadas: 25 elementos requeridos y decodificadores VideoToolbox disponibles; cero conexiones y reportes HID. No equivale a una instalación en otro Mac ni verifica Gatekeeper/notarización. La revisión visual nueva en navegador quedó incompleta por bloqueos de la herramienta; no se cuenta como aprobada.
+
+## Android preview
+
+Android uses a separate Tauri mobile entry point and local Kotlin plugin. The
+desktop renderer/input paths are unchanged. Native WebRTC owns video and the
+DataChannel; high-frequency touch input never passes through JavaScript. Native
+HTTPS/WSS reuse explicit certificate fingerprint trust from `net.rs`.
+
+Local commands: `npm run check`, `npm run build`,
+`cargo check --manifest-path src-tauri/Cargo.toml --lib`, and
+`cargo test --manifest-path src-tauri/Cargo.toml --lib` verify shared frontend and
+desktop regressions. Android SDK/NDK are absent from the development host; the
+Android APK workflow supplies them and compiles ARM64. It runs
+`:tauri-plugin-kvm-mobile:testDebugUnitTest` for pure gesture and HID mapping tests.
+These checks do not validate a physical Android device or KVM input delivery.
+
+Manual device acceptance remains required:
+
+- Install the debug APK on Android 7.0+ ARM64, connect to a real PicoKVM, verify
+  the fingerprint prompt before authentication and refusal after certificate change.
+- In portrait and landscape, open/close Panel; ensure its controls remain tappable
+  above the native video. Rotate during an active session and while the IME is open.
+- Drag a finger and verify relative motion with no click. Single tap: no click.
+  Two stationary taps within 350 ms: exactly one left click. Long press, distant
+  taps, drag-then-tap, multitouch and cancelled gestures: no click.
+- Open Android's keyboard with the toolbar button. Check letters, US punctuation,
+  composition/commit, backspace, Enter and the special key strip. Unsupported
+  non-US characters must show a warning. Test with Gboard and the device vendor IME.
+- Background the app, dismiss the keyboard with Android Back, reconnect, and
+  interrupt the network. Verify that no key or mouse button remains held remotely.
+- Verify audio/video codec negotiation and hardware decoding on the target phone.
+
+The preview omits Sunshine, desktop GPU filters and saved passwords. Its APK uses
+a CI-generated debug key; installing a later run may require uninstalling the old
+preview, which removes local trust. No production signing credentials are stored.

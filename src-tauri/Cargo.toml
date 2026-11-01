@@ -18,15 +18,8 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-moonlight-common = { path = "vendor/moonlight-common", default-features = false, features = ["http-client", "std", "rustcrypto"] }
-gstreamer-app = "0.24"
 pem = "3"
 tauri = { version = "2", features = [] }
-glib = "0.21"
-gstreamer = { version = "0.24", features = ["v1_24"] }
-gstreamer-video = { version = "0.24", features = ["v1_24"] }
-gstreamer-webrtc = { version = "0.24", features = ["v1_24"] }
-gstreamer-sdp = { version = "0.24", features = ["v1_24"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
@@ -39,6 +32,18 @@ base64 = "0.22"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-kvm-mobile = { path = "tauri-plugin-kvm-mobile" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+moonlight-common = { path = "vendor/moonlight-common", default-features = false, features = ["http-client", "std", "rustcrypto"] }
+gstreamer-app = "0.24"
+glib = "0.21"
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
+gstreamer-webrtc = { version = "0.24", features = ["v1_24"] }
+gstreamer-sdp = { version = "0.24", features = ["v1_24"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }

@@ -1,0 +1,62 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'src-tauri/**', 'package*.json', '.github/workflows/android.yml', 'scripts/android-*.py']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install Android tools
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - name: Initialize Android project
+        run: |
+          npm run tauri -- android init --ci
+          python3 scripts/android-project.py
+      - name: Compile installable test APK
+        run: npm run tauri -- android build --debug --apk --target aarch64 --ci
+      - name: Test native gestures and keyboard
+        working-directory: src-tauri/gen/android
+        run: ./gradlew :tauri-plugin-kvm-mobile:testDebugUnitTest
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk artifacts/kvm-client-android-arm64-debug.apk
+          sha256sum artifacts/*.apk > artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kvm-client-android-arm64
+          path: artifacts/*
+          if-no-files-found: error
+      - name: Publish Android preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "android-preview-${GITHUB_RUN_NUMBER}" artifacts/* --target "$GITHUB_SHA" --prerelease --title "Android preview ${GITHUB_RUN_NUMBER}" --notes-file docs/android-release-notes.md

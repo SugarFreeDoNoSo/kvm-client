@@ -1,0 +1,8 @@
+[default]
+description = "Native Android video, trackpad, keyboard and session events for the local console"
+permissions = ["allow-native-session"]
+
+[[permission]]
+identifier = "allow-native-session"
+description = "Control the native KVM session and listen for signaling events"
+commands.allow = ["execute", "registerListener", "removeListener"]

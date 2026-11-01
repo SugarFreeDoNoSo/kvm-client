@@ -131,3 +131,25 @@ KVM Client se distribuye bajo **GPL-3.0-or-later**; consulta [LICENSE](LICENSE).
 Moonlight conserva su licencia y atribución en `src-tauri/vendor/moonlight-common/`;
 los shaders SGSR conservan su aviso BSD. El paquete incluye las licencias del runtime
 multimedia y la release proporciona las fuentes correspondientes a su etiqueta.
+
+### Android preview
+
+Android 7.0+ (ARM64) has a native WebRTC renderer, relative touch trackpad and
+Android system keyboard. Open **Panel** to connect; use **Teclado** for text input.
+One tap does nothing; two quick stationary taps make one left click. The remote
+keyboard layout must be US. This first preview does not include Sunshine or the
+desktop GPU image controls.
+
+Install Android SDK platform 36, NDK 28.2.13676358, Java 17 and the Rust Android
+ARM64 target. Set `ANDROID_HOME` and `NDK_HOME`, then run:
+
+```sh
+npm ci
+npm run android:init
+npm run android:build
+```
+
+`npm run android:dev` runs on an attached device. GitHub's **Android APK** workflow
+builds and tests the native plugin and publishes a downloadable debug APK as an
+Android prerelease. See [Android verification](docs/verification.md#android-preview)
+for remaining physical-device checks and signing limitations.

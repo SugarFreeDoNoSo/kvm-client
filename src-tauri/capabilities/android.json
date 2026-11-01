@@ -1,0 +1,7 @@
+{
+  "identifier": "android-native-session",
+  "description": "Native media and input for the Android console",
+  "windows": ["main"],
+  "platforms": ["android"],
+  "permissions": ["kvm-mobile:default"]
+}
