@@ -1,10 +1,15 @@
 //! Deterministic HID queue. No wall clock, network, or GUI code lives here.
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_PENDING: usize = 1024;
+// Conservative keyboard pacing, independent of the mouse sampling rate.
+const KEYBOARD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_MOTION: i64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -53,6 +58,7 @@ pub struct Scheduler {
     // USB HID usages, including modifier usages 0xe0..=0xe7. Backends
     // normalize their platform key codes before entering the shared scheduler.
     pressed: BTreeSet<u8>,
+    next_keyboard: Duration,
 }
 
 fn rpc(method: &str, params: Value) -> Value {
@@ -78,6 +84,7 @@ impl Default for Scheduler {
             wheel_fraction: 0.0,
             buttons: 0,
             pressed: BTreeSet::new(),
+            next_keyboard: Duration::ZERO,
         }
     }
 }
@@ -214,9 +221,41 @@ impl Scheduler {
         });
     }
 
+    /// Keep keyboard transitions paced and FIFO, but let motion pass a keyboard
+    /// cooldown. Mouse buttons and wheel remain ordering barriers.
+    /// The worker must use the same timestamp for peek and acknowledgement.
+    fn eligible_index(&self, now: Duration) -> Option<usize> {
+        let front = self.queue.front()?;
+        if !matches!(front, Pending::Keyboard { .. }) || now >= self.next_keyboard {
+            return Some(0);
+        }
+        self.queue
+            .iter()
+            .position(|item| !matches!(item, Pending::Keyboard { .. }))
+            .filter(|index| matches!(self.queue.get(*index), Some(Pending::Motion { .. })))
+    }
+
+    pub fn peek_at(&self, now: Duration) -> Option<Value> {
+        self.peek_index(self.eligible_index(now)?)
+    }
+
+    pub fn acknowledge_at(&mut self, now: Duration) {
+        let Some(index) = self.eligible_index(now) else {
+            return;
+        };
+        if matches!(self.queue.get(index), Some(Pending::Keyboard { .. })) {
+            self.next_keyboard = now.saturating_add(KEYBOARD_INTERVAL);
+        }
+        self.acknowledge_index(index);
+    }
+
     /// Inspect a report without consuming it. Caller acknowledges only a successful send.
     pub fn peek(&self) -> Option<Value> {
-        Some(match self.queue.front()? {
+        self.peek_index(0)
+    }
+
+    fn peek_index(&self, index: usize) -> Option<Value> {
+        Some(match self.queue.get(index)? {
             Pending::Motion { x, y, buttons } => {
                 let (dx, dy) = motion_chunk(*x, *y);
                 rpc("relMouseReport", json!({"dx":dx,"dy":dy,"buttons":buttons}))
@@ -235,7 +274,11 @@ impl Scheduler {
     }
 
     pub fn acknowledge(&mut self) {
-        let finished = match self.queue.front_mut() {
+        self.acknowledge_index(0);
+    }
+
+    fn acknowledge_index(&mut self, index: usize) {
+        let finished = match self.queue.get_mut(index) {
             Some(Pending::Motion { x, y, .. }) => {
                 let (dx, dy) = motion_chunk(*x, *y);
                 *x -= dx;
@@ -250,7 +293,7 @@ impl Scheduler {
             None => false,
         };
         if finished {
-            self.queue.pop_front();
+            self.queue.remove(index);
         }
     }
 }
@@ -492,6 +535,195 @@ mod tests {
             drain(&mut s)[0]["params"]["keys"],
             json!([4, 5, 6, 7, 8, 9])
         );
+    }
+
+    #[test]
+    fn keyboard_bursts_keep_press_release_order_at_all_mouse_rates() {
+        for hz in [125, 250, 500, 1000] {
+            let mut s = Scheduler::default();
+            s.set_settings(InputSettings {
+                hz,
+                sensitivity: 1.0,
+            })
+            .unwrap();
+            for code in [225, 4, 5] {
+                s.key(code, true).unwrap();
+            }
+            for code in [4, 5, 225] {
+                s.key(code, false).unwrap();
+            }
+            let expected = [
+                json!([]),
+                json!([4]),
+                json!([4, 5]),
+                json!([5]),
+                json!([]),
+                json!([]),
+            ];
+            for (i, keys) in expected.into_iter().enumerate() {
+                let now = KEYBOARD_INTERVAL * i as u32;
+                if i > 0 {
+                    assert!(s.peek_at(now - Duration::from_millis(1)).is_none());
+                }
+                let report = s.peek_at(now).unwrap();
+                assert_eq!(report["params"]["keys"], keys);
+                assert_eq!(report["params"]["modifier"], if i < 5 { 2 } else { 0 });
+                s.acknowledge_at(now);
+            }
+            assert_eq!(s.len(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_keyboard_send_keeps_report_and_pacing_starts_on_success() {
+        let mut s = Scheduler::default();
+        s.key(4, true).unwrap();
+        s.key(4, false).unwrap();
+        let first = s.peek_at(Duration::ZERO).unwrap();
+        let retry = Duration::from_millis(100);
+        assert_eq!(s.peek_at(retry), Some(first));
+        s.acknowledge_at(retry);
+        assert!(s.peek_at(retry).is_none());
+        assert_eq!(
+            s.peek_at(retry + KEYBOARD_INTERVAL).unwrap()["params"]["keys"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn keyboard_wait_allows_motion_and_release_discards_stale_keys() {
+        let mut s = Scheduler::default();
+        s.key(4, true).unwrap();
+        s.key(4, true).unwrap(); // OS autorepeat must not add reports.
+        s.key(4, false).unwrap();
+        s.motion(9.0, 0.0).unwrap();
+        assert_eq!(s.len(), 3);
+        s.acknowledge_at(Duration::ZERO);
+        assert_eq!(
+            s.peek_at(Duration::from_millis(1)).unwrap()["params"]["dx"],
+            9
+        );
+        s.release();
+        assert_eq!(
+            s.peek_at(Duration::from_millis(1)).unwrap()["method"],
+            "relMouseReport"
+        );
+        s.acknowledge_at(Duration::from_millis(1));
+        assert!(s.peek_at(Duration::from_millis(1)).is_none());
+        let released = s.peek_at(KEYBOARD_INTERVAL).unwrap();
+        assert_eq!(released["params"]["keys"], json!([]));
+        assert_eq!(released["params"]["modifier"], 0);
+        s.acknowledge_at(KEYBOARD_INTERVAL);
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn mouse_continues_during_keyboard_cooldown_without_reordering_keys() {
+        let mut s = Scheduler::default();
+        s.key(4, true).unwrap();
+        s.key(5, true).unwrap();
+        s.key(4, false).unwrap();
+        s.motion(12.0, -4.0).unwrap();
+        assert_eq!(
+            s.peek_at(Duration::ZERO).unwrap()["params"]["keys"],
+            json!([4])
+        );
+        s.acknowledge_at(Duration::ZERO);
+
+        let moving = Duration::from_millis(1);
+        let motion = s.peek_at(moving).unwrap();
+        assert_eq!(motion["method"], "relMouseReport");
+        assert_eq!(motion["params"]["dx"], 12);
+        assert_eq!(motion["params"]["dy"], -4);
+        s.acknowledge_at(moving);
+        assert!(s.peek_at(moving).is_none());
+
+        assert_eq!(
+            s.peek_at(KEYBOARD_INTERVAL).unwrap()["params"]["keys"],
+            json!([4, 5])
+        );
+        s.acknowledge_at(KEYBOARD_INTERVAL);
+        assert!(s.peek_at(KEYBOARD_INTERVAL + moving).is_none());
+        assert_eq!(
+            s.peek_at(KEYBOARD_INTERVAL * 2).unwrap()["params"]["keys"],
+            json!([5])
+        );
+        s.acknowledge_at(KEYBOARD_INTERVAL * 2);
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn keyboard_cooldown_never_bypasses_button_or_wheel_barriers() {
+        for wheel in [false, true] {
+            let mut s = Scheduler::default();
+            s.key(4, true).unwrap();
+            s.key(4, false).unwrap();
+            s.motion(10.0, 0.0).unwrap();
+            if wheel {
+                s.wheel(1.0).unwrap();
+            } else {
+                s.button(1, true).unwrap();
+            }
+            s.motion(20.0, 0.0).unwrap();
+            s.acknowledge_at(Duration::ZERO);
+
+            let moving = Duration::from_millis(1);
+            let first_motion = s.peek_at(moving).unwrap();
+            assert_eq!(first_motion["params"]["dx"], 10);
+            assert_eq!(first_motion["params"]["buttons"], 0);
+            s.acknowledge_at(moving);
+            assert!(s.peek_at(moving).is_none());
+
+            assert_eq!(
+                s.peek_at(KEYBOARD_INTERVAL).unwrap()["method"],
+                "keyboardReport"
+            );
+            s.acknowledge_at(KEYBOARD_INTERVAL);
+            let barrier = s.peek_at(KEYBOARD_INTERVAL).unwrap();
+            if wheel {
+                assert_eq!(barrier["method"], "wheelReport");
+            } else {
+                assert_eq!(barrier["params"]["dx"], 0);
+                assert_eq!(barrier["params"]["buttons"], 1);
+            }
+            s.acknowledge_at(KEYBOARD_INTERVAL);
+            assert_eq!(s.peek_at(KEYBOARD_INTERVAL).unwrap()["params"]["dx"], 20);
+            s.acknowledge_at(KEYBOARD_INTERVAL);
+            assert_eq!(s.len(), 0);
+        }
+    }
+
+    #[test]
+    fn bypassed_motion_retries_and_preserves_every_partial_delta() {
+        let mut s = Scheduler::default();
+        s.key(4, true).unwrap();
+        s.key(4, false).unwrap();
+        s.motion(301.0, -9.0).unwrap();
+        s.acknowledge_at(Duration::ZERO);
+        let first = s.peek_at(Duration::from_millis(1)).unwrap();
+        // A failed transport send must retry the same motion without advancing keys.
+        assert_eq!(s.peek_at(Duration::from_millis(2)), Some(first.clone()));
+        s.acknowledge_at(Duration::from_millis(2));
+        let mut total = (
+            first["params"]["dx"].as_i64().unwrap(),
+            first["params"]["dy"].as_i64().unwrap(),
+        );
+        for tick in 3..=4 {
+            let now = Duration::from_millis(tick);
+            let chunk = s.peek_at(now).unwrap();
+            assert_eq!(chunk["method"], "relMouseReport");
+            total.0 += chunk["params"]["dx"].as_i64().unwrap();
+            total.1 += chunk["params"]["dy"].as_i64().unwrap();
+            s.acknowledge_at(now);
+        }
+        assert_eq!(total, (301, -9));
+        assert!(s.peek_at(Duration::from_millis(4)).is_none());
+        assert_eq!(
+            s.peek_at(KEYBOARD_INTERVAL).unwrap()["params"]["keys"],
+            json!([])
+        );
+        s.acknowledge_at(KEYBOARD_INTERVAL);
+        assert_eq!(s.len(), 0);
     }
 
     #[test]

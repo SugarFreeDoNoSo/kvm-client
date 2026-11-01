@@ -29,6 +29,27 @@ enum SenderEvent {
     Error(String),
 }
 
+#[derive(Clone, Copy)]
+struct ProfileCheck {
+    name: &'static str,
+    filter: VideoFilter,
+    native_size: bool,
+    scale_factor: u8,
+    sharpness: f32,
+}
+
+impl ProfileCheck {
+    fn settings(self) -> VideoSettings {
+        VideoSettings {
+            filter: self.filter,
+            sharpness: self.sharpness,
+            native_size: self.native_size,
+            scale_factor: self.scale_factor,
+            ..VideoSettings::default()
+        }
+    }
+}
+
 struct Sender(gst::Pipeline);
 impl Drop for Sender {
     fn drop(&mut self) {
@@ -165,9 +186,21 @@ pub async fn run(
         None
     });
     // Accept the receiver's RPC DataChannel but never send any HID RPC.
+    let pause_probe_received = Arc::new(AtomicBool::new(false));
+    let probe_received = pause_probe_received.clone();
     peer.connect("on-data-channel", false, move |values| {
         if let Ok(channel) = values[1].get::<gst_webrtc::WebRTCDataChannel>() {
             channel.connect_on_open(|_| eprintln!("Synthetic sender RPC connected"));
+            let received = probe_received.clone();
+            channel.connect_on_message_string(move |_, message| {
+                if let Some(message) = message {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(message) {
+                        if value["method"] == "getVideoState" && value["id"] == 900002 {
+                            received.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            });
         }
         None
     });
@@ -175,13 +208,65 @@ pub async fn run(
         .0
         .set_state(gst::State::Playing)
         .map_err(|e| e.to_string())?;
+    let profiles = [
+        ProfileCheck {
+            name: "original",
+            filter: VideoFilter::Bilinear,
+            native_size: false,
+            scale_factor: 0,
+            sharpness: 0.0,
+        },
+        ProfileCheck {
+            name: "desktop",
+            filter: VideoFilter::Desktop,
+            native_size: false,
+            scale_factor: 0,
+            sharpness: 0.15,
+        },
+        ProfileCheck {
+            name: "gaming",
+            filter: VideoFilter::Gaming,
+            native_size: false,
+            scale_factor: 0,
+            sharpness: 0.35,
+        },
+        ProfileCheck {
+            name: "desktop-native",
+            filter: VideoFilter::Desktop,
+            native_size: true,
+            scale_factor: 0,
+            sharpness: 0.0,
+        },
+        ProfileCheck {
+            name: "nearest",
+            filter: VideoFilter::Nearest,
+            native_size: false,
+            scale_factor: 0,
+            sharpness: 0.0,
+        },
+        ProfileCheck {
+            name: "nearest-2x",
+            filter: VideoFilter::Nearest,
+            native_size: false,
+            scale_factor: 2,
+            sharpness: 0.0,
+        },
+    ];
+    let profile_count = if seconds >= 4 { profiles.len() } else { 3 };
+    let profile_duration =
+        Duration::from_secs_f64((seconds as f64 / profile_count as f64).max(0.5));
+    engine.configure(profiles[0].settings())?;
     engine.start()?;
     let mut remote_ready = false;
     let mut pending: Vec<(u32, String)> = Vec::new();
     let mut rpc = false;
     let mut health = FrameHealth::new(Instant::now());
     let mut first_frame = None;
-    let mut sharp_enabled = false;
+    let mut profile_index = 0usize;
+    let mut profile_started = None;
+    let mut profile_frames = (0, 0);
+    let mut profile_evidence = Vec::new();
+    let mut negotiated_fit_size: Option<(u32, u32)> = None;
     let start = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -218,29 +303,105 @@ pub async fn run(
                 }
                 let stats=engine.stats();
                 let video_state=health.observe(Instant::now(),engine.frame_counts());
-                if video_state==VideoState::Playing && first_frame.is_none(){first_frame=Some(Instant::now());}
+                if video_state==VideoState::Playing && first_frame.is_none(){
+                    let now=Instant::now();
+                    first_frame=Some(now);
+                    profile_started=Some(now);
+                    profile_frames=engine.frame_counts();
+                }
                 if first_frame.is_some() && video_state!=VideoState::Playing {
                     return Err("La transmisión sintética se congeló durante la prueba".into());
                 }
-                println!("{}",json!({"synthetic":true,"elapsedSeconds":start.elapsed().as_secs_f64(),"video":stats}));
-                if let Some(first)=first_frame {
-                    if !sharp_enabled && first.elapsed()>=Duration::from_secs(seconds/2) {
-                        engine.configure(VideoSettings{filter:VideoFilter::Sharp,sharpness:0.35})?;
-                        sharp_enabled=true;
-                        eprintln!("Synthetic: spatial sharpness enabled during playback");
-                    }
-                    if first.elapsed()>=Duration::from_secs(seconds) {
-                        if !rpc{return Err("La prueba sintética no abrió RPC".into());}
-                        if !stats.decoded_fps.is_some_and(|fps|fps>0.0) || !stats.presented_fps.is_some_and(|fps|fps>0.0) {
-                            return Err("La transmisión sintética dejó de decodificar o presentar cuadros después de activar el filtro".into());
+                println!("{}",json!({"synthetic":true,"elapsedSeconds":start.elapsed().as_secs_f64(),"requestedProfile":profiles[profile_index].name,"requestedNativeSize":profiles[profile_index].native_size,"video":stats}));
+                if let Some(since)=profile_started {
+                    if since.elapsed()>=profile_duration {
+                        let frames=engine.frame_counts();
+                        let decoded=frames.0.saturating_sub(profile_frames.0);
+                        let presented=frames.1.saturating_sub(profile_frames.1);
+                        if decoded<3 || presented<3 {
+                            return Err(format!("El perfil {} no produjo suficientes cuadros: decodificados={decoded}, presentados={presented}",profiles[profile_index].name));
                         }
-                        println!("{}",json!({"result":"pass","synthetic":true,"decodedFrames":engine.frame_counts().0,"presentedFrames":engine.frame_counts().1,"rpcConnected":rpc,"hidReportsSent":0,"sharpFilterTested":sharp_enabled}));
-                        return Ok(());
+                        if stats.input_width!=640 || stats.input_height!=360 || stats.output_width==0 || stats.output_height==0 {
+                            return Err(format!("Dimensiones no negociadas para el perfil {}: entrada={}x{}, salida={}x{}",profiles[profile_index].name,stats.input_width,stats.input_height,stats.output_width,stats.output_height));
+                        }
+                        let output_size=(stats.output_width,stats.output_height);
+                        if let Some(expected)=negotiated_fit_size {
+                            let valid_size=if profiles[profile_index].native_size || profiles[profile_index].scale_factor!=0 {
+                                output_size.0>=expected.0 && output_size.1>=expected.1
+                                    && (output_size.0==expected.0 || output_size.1==expected.1)
+                            } else {
+                                output_size==expected
+                            };
+                            if !valid_size {
+                                return Err(format!("El perfil {} negoció un tamaño físico incompatible: ajuste={expected:?}, negociado={output_size:?}",profiles[profile_index].name));
+                            }
+                        } else {
+                            negotiated_fit_size=Some(output_size);
+                        }
+                        profile_evidence.push(json!({
+                            "profile":profiles[profile_index].name,
+                            "requestedNativeSize":profiles[profile_index].native_size,
+                            "requestedScaleFactor":profiles[profile_index].scale_factor,
+                            "inputWidth":stats.input_width,"inputHeight":stats.input_height,
+                            "outputWidth":stats.output_width,"outputHeight":stats.output_height,
+                            "decodedFrames":decoded,"presentedFrames":presented,
+                            "filterProcessingMs":stats.filter_processing_ms,
+                            "sinkDroppedFrames":stats.sink_dropped_frames
+                        }));
+                        if profile_index+1==profile_count {
+                            if !rpc{return Err("La prueba sintética no abrió RPC".into());}
+                            if !stats.decoded_fps.is_some_and(|fps|fps>0.0) || !stats.presented_fps.is_some_and(|fps|fps>0.0) {
+                                return Err("La transmisión sintética dejó de decodificar o presentar cuadros al cambiar de perfil".into());
+                            }
+                            let pause = check_video_pause(&engine, &pause_probe_received, &cancel).await?;
+                            while let Ok(event) = receiver_events.try_recv() {
+                                if let MediaEvent::Error(error) = event { return Err(error); }
+                            }
+                            println!("{}",json!({"result":"pass","synthetic":true,"decodedFrames":frames.0,"presentedFrames":frames.1,"rpcConnected":rpc,"hidReportsSent":0,"profilesTested":profile_evidence,"videoPause":pause}));
+                            return Ok(());
+                        }
+                        profile_index+=1;
+                        engine.configure(profiles[profile_index].settings())?;
+                        profile_started=Some(Instant::now());
+                        profile_frames=engine.frame_counts();
+                        eprintln!("Synthetic: testing profile {} during playback",profiles[profile_index].name);
                     }
                 } else if start.elapsed()>Duration::from_secs(20) {return Err("La prueba WebRTC sintética no produjo cuadros en 20 segundos".into());}
             },
         }
     }
+}
+
+async fn check_video_pause(
+    engine: &MediaEngine,
+    probe_received: &AtomicBool,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    engine.set_video_paused(true)?;
+    // Allow the single-frame render queue and a frame already in the decoder to drain.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let before = engine.frame_counts();
+    engine.send_rpc(json!({"jsonrpc":"2.0","method":"getVideoState","params":{},"id":900002}))?;
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let after = engine.frame_counts();
+    if after != before {
+        return Err(format!("El video siguió decodificando o presentando mientras estaba pausado: {before:?} → {after:?}"));
+    }
+    if !probe_received.load(Ordering::Acquire) {
+        return Err("El canal de control no entregó la consulta durante la pausa de video".into());
+    }
+    engine.set_video_paused(false)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !cancel.load(Ordering::Acquire) {
+        let current = engine.frame_counts();
+        if current.0 > after.0 && current.1 > after.1 {
+            return Ok(
+                json!({"pausedDecodedFrames":after.0-before.0,"pausedPresentedFrames":after.1-before.1,"rpcDeliveredWhilePaused":true,"resumed":true}),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err("El video no volvió a decodificar y presentar cuadros después de reanudar".into())
 }
 
 #[cfg(test)]

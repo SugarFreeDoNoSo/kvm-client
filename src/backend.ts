@@ -9,6 +9,8 @@ export interface AppStatus {
   state: ConnectionState;
   phase: ConnectionPhase;
   videoState: VideoState;
+  videoPaused: boolean;
+  inputEnabled: boolean;
   message: string;
   address: string;
   capture: boolean;
@@ -23,6 +25,12 @@ export interface Metrics {
   receivedFps: number | null;
   decodedFps: number | null;
   presentedFps: number | null;
+  inputWidth: number;
+  inputHeight: number;
+  outputWidth: number;
+  outputHeight: number;
+  filterProcessingMs: number | null;
+  sinkDroppedFrames: number | null;
   rttMs: number | null;
   packetsLost: number | null;
   queueDepth: number;
@@ -42,9 +50,38 @@ export interface InputSettings {
 }
 
 export interface VideoSettings {
-  filter: "bilinear" | "sharp";
+  filter: "original" | "desktop" | "gaming" | "nearest";
   sharpness: number;
+  nativeSize: boolean;
+  scaleFactor: number;
+  antiRinging: number;
+  edgeThreshold: number;
+  downscaleAntiAliasing: boolean;
 }
+
+export interface SunshineStreamSettings {
+  width: number;
+  height: number;
+  fps: number;
+  bitrateKbps: number;
+  network: "auto" | "local" | "remote";
+  audioEnabled: boolean;
+  volume: number;
+  hostAudio: boolean;
+}
+
+export interface Preferences {
+  address: string;
+  recentAddresses: string[];
+  sunshineEndpoint: { ip: string; port: number } | null;
+  video: VideoSettings;
+  input: InputSettings;
+  dashboardExpanded: boolean;
+  rememberPassword: boolean;
+  stream: SunshineStreamSettings;
+}
+
+export type PreferencesPatch = Partial<Omit<Preferences, "recentAddresses">>;
 
 export const nativeAvailable = isTauri();
 

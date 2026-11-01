@@ -113,3 +113,69 @@ No se modificó firmware, códec, EDID ni configuración del escritorio. Las ven
 El botón de pantalla completa elimina el espacio nativo de la barra (GTK y AppKit). Al liberar una captura activa con Ctrl+Alt+Esc (Linux) o Ctrl+Option+Esc (macOS), la aplicación sale de pantalla completa y recupera los controles. También se puede salir con los controles de pantalla completa del sistema; el cambio de tamaño sincroniza la barra y el botón.
 
 Validación pendiente con una sesión remota real: comprobar que el video ocupa todo el espacio, que el atajo recupera los controles y que entrar/salir repetidamente conserva la captura y el tamaño de la imagen. La compilación en macOS no valida la ruta GTK de Linux ni la interacción física del teclado y mouse.
+
+### Limitación de ráfagas de teclado
+
+Pruebas deterministas añadidas: separación de 20 ms con mouse a 125/250/500/1000 Hz, orden de pulsación/liberación y modificadores, conservación del reporte tras fallo de transporte, eliminación de repeticiones redundantes y liberación de emergencia sin ejecutar teclas antiguas.
+
+Pendiente en PicoKVM real: escritura rápida, combinaciones de modificadores, teclas mantenidas, escritura simultánea con movimiento y desconexión con teclas pulsadas. Confirmar pérdidas o duplicados y latencia antes de considerar los 50 reportes/s una frecuencia validada para el dispositivo.
+
+### Recuperación de KeyUp en combinaciones Command de macOS
+
+Pruebas añadidas para recuperar una liberación omitida una sola vez, conservar teclas físicamente pulsadas, evitar duplicar KeyUp normales y terminar Command+V con un reporte de teclado vacío. Pendiente verificar Windows+V y Windows+C con un teclado físico y PicoKVM, soltando primero V y luego Command y también en el orden inverso. Las pruebas simulan el estado físico; no demuestran la entrega de eventos de AppKit ni del firmware.
+
+### Emparejamiento Sunshine: parámetros de URL
+
+La prueba `pairing_url_encodes_device_name_without_injecting_parameters` verifica que el nombre `KVM Client` y nombres con espacios, Unicode y caracteres reservados llegan como un único parámetro, sin crear fragmentos ni alterar la solicitud. Una prueba HTTP local comprueba que la solicitud inicial llega al servidor y espera la respuesta. Las pruebas `cargo test --manifest-path src-tauri/Cargo.toml sunshine` pasaron, incluida la validación TLS con servidor local. Estas comprobaciones son sintéticas: queda pendiente pulsar Emparejar, confirmar una solicitud pendiente en Sunshine e introducir el PIN en un servidor real.
+
+### Flujo de conexión Sunshine
+
+El panel informa cuándo hace falta conectar PicoKVM y cuándo Sunshine no ofrece aplicaciones; identifica la etapa de los errores y permite restablecer el estado. La preparación del audio precede al inicio remoto de la aplicación. Pendiente de verificar con un equipo Sunshine real: selección de aplicación, arranque, video, audio, alternancia de fuentes y recuperación tras un fallo; las pruebas locales no demuestran la reproducción remota.
+
+### Sunshine: autenticación HTTPS después del PIN
+
+La configuración TLS de Sunshine desactiva la reanudación de sesión y mantiene la verificación exacta del certificado. Una prueba local con autenticación mutua confirma tres handshakes completos; con la configuración anterior falla al observar dos sesiones reanudadas. Se verificaron consultas consecutivas de información y aplicaciones contra el servidor emparejado con `saved_identity_authenticates_repeated_server_queries` (prueba ignorada por defecto; requiere `KVM_SUNSHINE_HOST` y `KVM_SUNSHINE_CONFIG_DIR`, puerto HTTP 47989). La identidad se conserva si falla solo la actualización posterior al emparejamiento. Esta validación no inicia una transmisión ni demuestra video, audio o entrada física.
+
+### Movimiento durante la espera del teclado
+
+Pruebas deterministas cubren movimiento a 1 ms con varias transiciones de teclado pendientes, orden del teclado a 20/40 ms, barreras de botones y rueda y conservación de deltas tras un envío fallido. El movimiento puede adelantarse a una tecla pendiente; los clics y la rueda conservan su orden. Pendiente validación física: apuntar mientras se mantiene WASD, disparar y mover el mouse, soltar teclas y repetir con cambios rápidos de dirección. No se ha medido latencia en Valorant ni el polling USB; los deltas AppKit actuales no son una ruta verificada de entrada sin aceleración.
+
+### Perfiles de reescalado y resolución física
+
+Perfiles disponibles: Original (bilineal, comparación), Escritorio (bicúbico con control de halos), Juegos 3D (adaptación SGSR v1) y Píxeles (vecino más cercano). Ajustar negocia salida a la región física con relación de aspecto conservada; las escalas manuales centran con offsets enteros, añaden márgenes o recortan. Se aplica el mismo ajuste a ambas fuentes nativas.
+
+La prueba `kvm-smoke --synthetic --seconds 8` pasó en macOS con VideoToolbox: entrada 640×360, salida 1920×1080 en los tres perfiles; lienzo 1:1 de 1920×1200. Las fases registraron 60/75/75/75 cuadros nuevos presentados y cero descartes del sink, sin avisos de GStreamer en esa ejecución. Los tiempos de pared del filtro en las muestras finales fueron aproximadamente 0,16/0,10/0,15/0,22 ms; incluyen esperas y no son medidas de tiempo GPU, latencia de entrada o mejoras de FPS del juego. Los contadores de decodificación y presentación pueden diferir por arranque y la cola de último cuadro; cero descartes del sink no prueba cero descartes totales.
+
+Las pruebas unitarias cubren ajuste de aspecto, PAR, viewport físico y deserialización de perfiles. Comparaciones PNG locales de texto, barras de color, damero y zona de frecuencias comprueban compilación GLSL y salida diferenciada; no miden estabilidad temporal, calidad perceptual ni reconstruyen detalle ausente en el video. Pendiente: GPU/sesión GTK de Linux, cambios entre pantallas con distinta escala y juegos reales con movimiento rápido. No se implementó generación de fotogramas ni mejora generativa; MetalFX exigiría una ruta Metal propia.
+
+La comprobación `kvm-smoke --sunshine-self-test` también pasó: cuatro cambios de fuente; 120 cuadros decodificados y 119 presentados en cada motor, sin avisos de GStreamer, cero conexiones remotas y cero reportes HID. Esta prueba usa el perfil Escritorio compartido y no autentica un servidor Sunshine real.
+
+La lectura GL a PNG verificó además Escritorio con nitidez 0 y viewport impar 1281×721: el área central de 640×360 coincide exactamente con Original a resolución nativa (921.600 canales RGBA comparados, cero diferencias). Esto comprueba alineación 1:1 en esa escena; no sustituye una evaluación perceptual de texto o juegos.
+
+### Dashboard lateral, pantalla completa y persistencia
+
+La vista previa se revisó a 1280×900: panel lateral de 360 píxeles, contenido desplazable y dashboard completo sin desbordamiento horizontal. La prueba nativa `kvm-smoke --dashboard-self-test` pasó en macOS: ventana de 960 puntos con panel oculto de 0 y video de 960, lateral de 360 y video de 600, pantalla completa del sistema con dashboard de 1728 y video de 0, restauración a lateral y ocultación con pestaña visible. No abrió conexiones remotas ni envió HID. GTK conserva una implementación equivalente, pendiente de sesión Linux real.
+
+Las pruebas de preferencias verifican normalización de orígenes HTTPS, historial acotado, actualizaciones parciales, permisos 0600, ausencia de contraseñas en JSON y rechazo de archivos corruptos. El guardado de credenciales se ejecuta tras un login aceptado mediante HTTPS con certificado confiado; no al aceptar la solicitud de conexión en la interfaz. Las pruebas automatizadas no leen contraseñas del usuario. Keychain/Secret Service deben estar disponibles para recordar credenciales.
+
+Las opciones de Moonlight se prueban contra los campos de la solicitud real: resolución/FPS/bitrate/red/audio del host; audio local desactivado usa fakesink y el volumen se verifica en el elemento de GStreamer. La oferta de valores no garantiza capacidad del host remoto.
+
+### Pausa del video de PicoKVM sin cerrar el control
+
+La prueba WebRTC sintética final pasó con el receptor de producción: tras 350 ms de drenaje, los contadores de decodificación y presentación permanecieron constantes durante 650 ms; una consulta RPC de solo lectura llegó al par remoto mientras el video estaba pausado; después de reanudar aparecieron cuadros nuevos. Se enviaron cero reportes HID y no se abrieron conexiones a dispositivos. No hubo avisos de GStreamer en esa ejecución. Esto demuestra la separación local del video y el control, no una reducción de trabajo del codificador del KVM ni una mejora medida en Valorant.
+
+### Perfil EDID 720p
+
+Se generaron `profiles/edid/kvm-720p60.bin` (256 bytes) y su equivalente hexadecimal. Se verificaron encabezado EDID 1.3, número de extensiones, ambos checksums, DTD 1280×720 a 74,25 MHz con totales 1650×750 (60 Hz), polaridades positivas y tamaño físico 320×180 mm. La extensión CTA anuncia VIC 4 como nativo y VIC 1 como respaldo VGA obligatorio, incluye HDMI VSDB y VCDB; los rangos cubren ambos modos. La validación de campos se revisó por separado del generador. No se ejecutó edid-decode ni se importó en el dispositivo. No se fija 1 FPS: el registro RPC público revisado de LuckfoxTECH/kvm no expone un setter de FPS; setVideoRc ajusta QP. Los límites de longitud aceptados por el componente nativo set_edid quedan pendientes de verificación física.
+
+### Reescalado configurable y bloqueo de entrada
+
+`cargo test --manifest-path src-tauri/Cargo.toml` pasó con 67 pruebas y una ignorada por requerir un host Sunshine. Las cinco pruebas de `enabled_tests` verifican liberaciones HID, descarte de eventos tardíos, rechazo de captura desactivada, reactivación sin residuos, invalidación nativa y reintentos del transporte. No se enviaron reportes a un dispositivo real.
+
+`kvm-smoke --synthetic --seconds 12` pasó por Original, Escritorio, Juegos 3D, Escritorio 1:1, Píxeles y Píxeles 2×: entrada 640×360, salida ajustada 1920×1080 y lienzo manual 1920×1200, con cuadros nuevos en cada fase, cero descartes informados por el sink y cero avisos de GStreamer. RPC y pausa/reanudación siguieron funcionando. No mide latencia física ni rendimiento con juegos.
+
+La lectura OpenGL a PNG en macOS compiló los cuatro shaders principales con tres patrones cada uno. Las cuatro variantes GLSL de compatibilidad también compilaron y coincidieron exactamente con las variantes core sobre el mismo patrón. Píxeles 2× reprodujo exactamente una entrada 17×11 sobre un lienzo impar 39×27, incluidos los márgenes. Al reducir un damero de un píxel de 511×255 a 139×73, el suavizado redujo la diferencia media entre canales rojo/verde de 129,82 a 2,06 en Escritorio y de 63,47 a 2,06 en Juegos 3D; es una medida de ese patrón, no una puntuación perceptual. Con suavizado, cambiar nitidez no alteró la salida. El control de halos mantuvo un escalón gris 64–192 dentro de ese rango (sin control: 55–201), y los umbrales SGSR 1 y 32 produjeron salidas distintas sobre un patrón de bajo contraste. Pendiente: evaluación visual en Linux y juegos reales.
+
+### Paquete de distribución v0.1.0
+
+La suite final pasó con 69 pruebas y una ignorada, incluyendo dos pruebas de resolución del runtime privado. Tauri produjo una aplicación arm64 con mínimo macOS 26.0, calculado también sobre las bibliotecas incorporadas: 66 Mach-O y 19 plugins, sin dependencias externas salvo las bibliotecas Apple. Se verificaron las firmas ad hoc con `codesign --verify --deep --strict`, el DMG con `hdiutil verify` y el ZIP extrayéndolo en un directorio nuevo. Desde esa extracción, `--check-runtime` pasó con un registro GStreamer nuevo y sin rutas multimedia heredadas: 25 elementos requeridos y decodificadores VideoToolbox disponibles; cero conexiones y reportes HID. No equivale a una instalación en otro Mac ni verifica Gatekeeper/notarización. La revisión visual nueva en navegador quedó incompleta por bloqueos de la herramienta; no se cuenta como aprobada.

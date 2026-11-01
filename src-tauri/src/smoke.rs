@@ -1,7 +1,6 @@
 //! A real-device, video-only smoke check. Never captures or sends HID input.
 //! Requires an explicitly supplied SHA-256 certificate fingerprint.
 
-#[path = "bin/support/loopback.rs"]
 mod loopback;
 use crate::{
     health::{FrameHealth, VideoState},
@@ -29,6 +28,8 @@ struct Options {
     seconds: u64,
     synthetic: bool,
     input_self_test: bool,
+    sunshine_self_test: bool,
+    dashboard_self_test: bool,
 }
 
 fn options() -> Result<Options, String> {
@@ -38,6 +39,8 @@ fn options() -> Result<Options, String> {
         seconds: 10,
         synthetic: false,
         input_self_test: false,
+        sunshine_self_test: false,
+        dashboard_self_test: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -46,6 +49,8 @@ fn options() -> Result<Options, String> {
             "--fingerprint" => options.fingerprint = args.next().ok_or("Falta --fingerprint")?.to_uppercase(),
             "--seconds" => options.seconds = args.next().ok_or("Falta --seconds")?.parse().map_err(|_| "--seconds debe ser un entero")?,
             "--synthetic" => options.synthetic = true,
+            "--sunshine-self-test" => options.sunshine_self_test = true,
+            "--dashboard-self-test" => options.dashboard_self_test = true,
             "--input-self-test" => options.input_self_test = true,
             "--help" | "-h" => return Err("Uso: kvm-smoke --fingerprint AA:BB:… [--address https://192.168.100.8/] [--seconds 10], o kvm-smoke --synthetic [--seconds 10]. Contraseña opcional en KVM_PASSWORD; no se envían eventos HID.".into()),
             _ => return Err(format!("Argumento desconocido: {arg}")),
@@ -54,6 +59,14 @@ fn options() -> Result<Options, String> {
     options.address = net::normalize_address(&options.address)?.to_string();
     if !(1..=3600).contains(&options.seconds) {
         return Err("--seconds debe estar entre 1 y 3600".into());
+    }
+    if options.dashboard_self_test
+        && (options.input_self_test || options.synthetic || options.sunshine_self_test)
+    {
+        return Err("Usa --dashboard-self-test por separado".into());
+    }
+    if options.sunshine_self_test && (options.input_self_test || options.synthetic) {
+        return Err("Usa --sunshine-self-test por separado".into());
     }
     if options.input_self_test {
         if options.synthetic {
@@ -64,7 +77,7 @@ fn options() -> Result<Options, String> {
         }
         return Ok(options);
     }
-    if options.synthetic {
+    if options.synthetic || options.sunshine_self_test || options.dashboard_self_test {
         return Ok(options);
     }
     let fingerprint: Vec<_> = options.fingerprint.split(':').collect();
@@ -224,6 +237,7 @@ async fn smoke(
 /// Video diagnostics never create input capture. The explicit input self-test
 /// uses only a simulated transport and cannot connect to a KVM.
 pub fn run() -> Result<(), String> {
+    crate::runtime_environment::configure()?;
     let options = options()?;
     let mut context = crate::app_context();
     context.config_mut().app.windows.clear();
@@ -243,7 +257,11 @@ pub fn run() -> Result<(), String> {
                 .title("KVM · prueba de video sin control HID")
                 .inner_size(960.0, 600.0)
             .build()?;
-            video_host::install_diagnostic(&window.as_ref().window())?;
+            if options.dashboard_self_test {
+                video_host::install(&window, Arc::new(|| {}))?;
+            } else {
+                video_host::install_diagnostic(&window.as_ref().window())?;
+            }
             let closed = cancel.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -251,6 +269,28 @@ pub fn run() -> Result<(), String> {
                     closed.store(true, Ordering::SeqCst);
                 }
             });
+            if options.dashboard_self_test {
+                let completed = result.clone();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = video_host::self_test(window).await;
+                    *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                    let exit_handle = handle.clone();
+                    let _ = handle.run_on_main_thread(move || exit_handle.exit(0));
+                });
+                return Ok(());
+            }
+            if options.sunshine_self_test {
+                let completed = result.clone();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = crate::sunshine::synthetic_check(&handle).await;
+                    *completed.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                    let exit_handle = handle.clone();
+                    let _ = handle.run_on_main_thread(move || exit_handle.exit(0));
+                });
+                return Ok(());
+            }
             #[cfg(target_os = "macos")]
             if options.input_self_test {
                 let completed = result.clone();

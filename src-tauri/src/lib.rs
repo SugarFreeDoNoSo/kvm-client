@@ -2,14 +2,17 @@ mod health;
 mod input;
 mod media;
 mod net;
+mod preferences;
+mod runtime_environment;
 mod signaling;
 pub mod smoke;
+mod sunshine;
 mod video_host;
 
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -31,10 +34,12 @@ struct AppStatus {
     state: String,
     phase: String,
     video_state: String,
+    video_paused: bool,
     message: String,
     address: String,
     capture: bool,
     capture_requested: bool,
+    input_enabled: bool,
     input_backend: String,
     decoder: String,
 }
@@ -51,6 +56,12 @@ struct Metrics {
     packets_lost: Option<i64>,
     queue_depth: usize,
     congested: bool,
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+    filter_processing_ms: Option<f64>,
+    sink_dropped_frames: Option<u64>,
 }
 
 struct Connection {
@@ -69,6 +80,7 @@ struct Runtime {
     capture_lock: Mutex<()>,
     control_rtt: Mutex<Option<f64>>,
     video_health: Mutex<health::FrameHealth>,
+    video_count_offset: Mutex<(u64, u64)>,
     source_notice: Mutex<Option<String>>,
     shutdown: AtomicU8,
 }
@@ -79,6 +91,12 @@ struct AppState(Arc<Runtime>);
 impl Runtime {
     fn capture(&self, enabled: bool) -> Result<(), String> {
         let _capture = self.capture_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if enabled && !self.input().is_enabled() {
+            return Err(
+                "El mouse y teclado del KVM están desactivados; habilítalos antes de capturar"
+                    .into(),
+            );
+        }
         if enabled && self.status.lock().unwrap_or_else(|e| e.into_inner()).state != "connected" {
             return Err("Conecta el KVM antes de capturar la entrada".into());
         }
@@ -126,7 +144,11 @@ impl Runtime {
             .map_err(|e| e.to_string())
     }
     fn metrics(&self) -> Option<Metrics> {
-        let media = self.media()?;
+        let media = self
+            .app
+            .state::<sunshine::SunshineState>()
+            .selected_media()
+            .or_else(|| self.media())?;
         let video = media.stats();
         let input = self.input().stats();
         Some(Metrics {
@@ -141,6 +163,12 @@ impl Runtime {
             packets_lost: video.packets_lost,
             queue_depth: input.queue_depth,
             congested: input.congested,
+            input_width: video.input_width,
+            input_height: video.input_height,
+            output_width: video.output_width,
+            output_height: video.output_height,
+            filter_processing_ms: video.filter_processing_ms,
+            sink_dropped_frames: video.sink_dropped_frames,
         })
     }
 }
@@ -229,6 +257,7 @@ fn request_shutdown(runtime: Arc<Runtime>) {
     let _ = runtime.capture(false);
     tauri::async_runtime::spawn(async move {
         let _guard = runtime.actions.lock().await;
+        sunshine::shutdown(&runtime.app).await;
         stop_connection(&runtime).await;
         let completed = runtime.clone();
         let _ = runtime.app.run_on_main_thread(move || {
@@ -244,6 +273,7 @@ async fn connect_device(
     state: State<'_, AppState>,
     address: String,
     password: String,
+    remember_password: Option<bool>,
 ) -> Result<(), String> {
     let runtime = state.0.clone();
     let _guard = runtime.actions.lock().await;
@@ -261,12 +291,17 @@ async fn connect_device(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = health::FrameHealth::new(Instant::now());
     *runtime
+        .video_count_offset
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = (0, 0);
+    *runtime
         .source_notice
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
     runtime.update(|s| {
         s.phase = "auth".into();
         s.video_state = "waiting".into();
+        s.video_paused = false;
         s.state = "connecting".into();
         s.message = "Autenticando y preparando video…".into();
         s.address = normalized.clone();
@@ -278,7 +313,7 @@ async fn connect_device(
     let worker = runtime.clone();
     let task = tauri::async_runtime::spawn(async move {
         let result = tokio::select! {
-            result=run_connection(worker.clone(),&normalized,&password)=>result,
+            result=run_connection(worker.clone(),&normalized,&password,remember_password.unwrap_or(false))=>result,
             _=rx=>Ok(()),
         };
         {
@@ -293,6 +328,7 @@ async fn connect_device(
                 s.capture_requested = false;
                 s.decoder.clear();
                 s.video_state = "waiting".into();
+                s.video_paused = false;
                 match result {
                     Ok(()) => {
                         s.state = "disconnected".into();
@@ -328,6 +364,7 @@ async fn disconnect_device(state: State<'_, AppState>) -> Result<(), String> {
         s.state = "disconnected".into();
         s.phase = "idle".into();
         s.video_state = "waiting".into();
+        s.video_paused = false;
         s.message = "Desconectado".into();
         s.capture = false;
         s.capture_requested = false;
@@ -352,18 +389,78 @@ fn set_input_settings(state: State<'_, AppState>, settings: InputSettings) -> Re
 }
 
 #[tauri::command]
-fn set_video_settings(state: State<'_, AppState>, settings: VideoSettings) -> Result<(), String> {
-    if !settings.sharpness.is_finite() || !(0.0..=1.0).contains(&settings.sharpness) {
-        return Err("La nitidez debe estar entre 0 y 1".into());
-    }
-    if let Some(media) = state.0.media() {
-        media.configure(settings)?;
-    }
-    *state
+fn set_video_settings(
+    state: State<'_, AppState>,
+    sunshine: State<'_, sunshine::SunshineState>,
+    settings: VideoSettings,
+) -> Result<(), String> {
+    settings.validate()?;
+    let mut current = state
         .0
         .video_settings
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = settings;
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(media) = state.0.media() {
+        media.configure(settings)?;
+    }
+    if let Some(media) = sunshine.media() {
+        media.configure(settings)?;
+    }
+    *current = settings;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_kvm_video_paused(state: State<'_, AppState>, paused: bool) -> Result<(), String> {
+    let runtime = &state.0;
+    let _operation = runtime.actions.lock().await;
+    if runtime
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .state
+        != "connected"
+    {
+        return Err("Conecta PicoKVM antes de pausar su video".into());
+    }
+    let media = runtime.media().ok_or("No hay un receptor PicoKVM activo")?;
+    if media.is_video_paused() == paused {
+        return Ok(());
+    }
+    media.set_video_paused(paused)?;
+    if !paused {
+        *runtime
+            .video_count_offset
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = media.frame_counts();
+        let mut health = health::FrameHealth::new(Instant::now());
+        if runtime
+            .source_notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            health.source_ready(false, Instant::now());
+        }
+        *runtime
+            .video_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = health;
+    }
+    let message = if paused {
+        "Video de PicoKVM pausado · teclado y mouse disponibles"
+    } else {
+        "Reanudando video de PicoKVM…"
+    };
+    runtime.update(|status| {
+        status.video_paused = paused;
+        status.video_state = "waiting".into();
+        status.message = message.into();
+    });
+    let notice = Some(message.into());
+    let _ = runtime
+        .app
+        .run_on_main_thread(move || video_host::show_notice(notice));
     Ok(())
 }
 
@@ -373,9 +470,50 @@ fn set_capture(state: State<'_, AppState>, enabled: bool) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn set_kvm_input_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let runtime = &state.0;
+    let _capture = runtime
+        .capture_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let result = runtime.input().set_enabled(enabled);
+    runtime.update(|s| {
+        s.input_enabled = runtime.input().is_enabled();
+        if enabled && result.is_ok() {
+            s.message = "Mouse y teclado del KVM habilitados; pulsa Capturar para usarlos".into();
+        }
+    });
+    result
+}
+
+#[tauri::command]
 fn set_fullscreen(window: tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
     window.set_fullscreen(enabled).map_err(|e| e.to_string())?;
     video_host::set_toolbar_visible(&window, !enabled)
+}
+
+#[tauri::command]
+fn set_dashboard_expanded(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    expanded: bool,
+) -> Result<(), String> {
+    if expanded {
+        state.0.capture(false)?;
+    }
+    video_host::set_dashboard_expanded(&window, expanded)
+}
+
+#[tauri::command]
+fn set_dashboard_fullscreen(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        state.0.capture(false)?;
+    }
+    video_host::set_dashboard_fullscreen(&window, enabled)
 }
 
 async fn create_media(
@@ -417,8 +555,27 @@ async fn run_connection(
     runtime: Arc<Runtime>,
     address: &str,
     password: &str,
+    remember_password: bool,
 ) -> Result<(), String> {
     let session = net::DeviceSession::login(&runtime.trust_path()?, address, password).await?;
+    if remember_password {
+        let app = runtime.app.clone();
+        let verified_address = address.to_owned();
+        let verified_password = password.to_owned();
+        // Only store a credential after the pinned HTTPS login accepts it.
+        // A locked/unavailable keychain must not interrupt an authenticated session.
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = preferences::save_saved_password(
+                app.state::<preferences::PreferenceState>(),
+                verified_address,
+                verified_password,
+            )
+            .await
+            {
+                let _ = app.emit("kvm://credential-error", error);
+            }
+        });
+    }
     runtime.update(|s| {
         s.phase = "signaling".into();
         s.message = "Abriendo señalización segura…".into();
@@ -442,7 +599,14 @@ async fn run_connection(
     });
     let (tx, mut events) = mpsc::unbounded_channel();
     let media = create_media(runtime.clone(), tx).await?;
-    *runtime.media.lock().unwrap_or_else(|e| e.into_inner()) = Some(media.clone());
+    {
+        let settings = runtime
+            .video_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        media.configure(*settings)?;
+        *runtime.media.lock().unwrap_or_else(|e| e.into_inner()) = Some(media.clone());
+    }
     let mut started = false;
     let mut answer_applied = false;
     let mut candidates: Vec<(u32, String)> = Vec::new();
@@ -515,15 +679,36 @@ async fn run_connection(
     }
 }
 
+fn resumed_frame_counts(counts: (u64, u64), baseline: (u64, u64)) -> (u64, u64) {
+    (
+        counts.0.saturating_sub(baseline.0),
+        counts.1.saturating_sub(baseline.1),
+    )
+}
+
 fn update_video_health(runtime: &Runtime) {
     let Some(media) = runtime.media() else {
         return;
     };
+    if media.is_video_paused()
+        || runtime
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .video_paused
+    {
+        return;
+    }
+    let counts = media.frame_counts();
+    let offset = *runtime
+        .video_count_offset
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = runtime
         .video_health
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .observe(Instant::now(), media.frame_counts());
+        .observe(Instant::now(), resumed_frame_counts(counts, offset));
     let changed = runtime
         .status
         .lock()
@@ -577,6 +762,14 @@ fn handle_rpc(runtime: &Runtime, value: Value) -> Result<(), String> {
                 .source_notice
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = message.clone();
+            if runtime
+                .status
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .video_paused
+            {
+                return Ok(());
+            }
             runtime.update(|s| {
                 s.message = message.clone().unwrap_or_else(|| {
                     "Video HDMI disponible · captura el control para comenzar".into()
@@ -623,6 +816,31 @@ fn video_notice(video: &Value) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn resume_waits_for_new_frames_instead_of_old_cumulative_totals() {
+        let now = Instant::now();
+        let baseline = (1200, 1198);
+        let mut health = health::FrameHealth::new(now);
+        assert_eq!(
+            health.observe(now, resumed_frame_counts(baseline, baseline)),
+            health::VideoState::Waiting
+        );
+        assert_eq!(
+            health.observe(
+                now + Duration::from_secs(5),
+                resumed_frame_counts(baseline, baseline)
+            ),
+            health::VideoState::Waiting
+        );
+        assert_eq!(
+            health.observe(
+                now + Duration::from_secs(6),
+                resumed_frame_counts((1201, 1199), baseline)
+            ),
+            health::VideoState::Playing
+        );
+    }
+
+    #[test]
     fn source_signal_status_distinguishes_missing_input_from_transport_failure() {
         assert!(video_notice(&json!({"ready":false,"error":"no_signal"}))
             .unwrap()
@@ -639,7 +857,83 @@ fn app_context() -> tauri::Context<tauri::Wry> {
     tauri::generate_context!()
 }
 
+/// Offline release check: do not open a window, preferences, credentials or peers.
+fn check_runtime() -> Result<(), String> {
+    gstreamer::init().map_err(|error| error.to_string())?;
+    let required = [
+        "webrtcbin",
+        "nicesrc",
+        "nicesink",
+        "dtlssrtpdec",
+        "dtlssrtpenc",
+        "sctpenc",
+        "sctpdec",
+        "rtph264depay",
+        "h264parse",
+        "glupload",
+        "glcolorconvert",
+        "glshader",
+        "rtpbin",
+        "queue",
+        "valve",
+        "appsrc",
+        "capsfilter",
+        "fakesink",
+        "opusdec",
+        "audioconvert",
+        "audioresample",
+        "volume",
+        "autoaudiosink",
+        #[cfg(target_os = "macos")]
+        "glimagesinkelement",
+        #[cfg(target_os = "macos")]
+        "osxaudiosink",
+        #[cfg(target_os = "linux")]
+        "gtkglsink",
+    ];
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|factory| gstreamer::ElementFactory::find(factory).is_none())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Faltan elementos GStreamer: {}",
+            missing.join(", ")
+        ));
+    }
+    let decoders: Vec<_> = ["vtdec_hw", "vtdec", "avdec_h264", "openh264dec"]
+        .into_iter()
+        .filter(|factory| gstreamer::ElementFactory::find(factory).is_some())
+        .collect();
+    if decoders.is_empty() {
+        return Err("No hay un decodificador H.264 disponible".into());
+    }
+    println!(
+        "{}",
+        json!({
+            "result": "pass", "version": env!("CARGO_PKG_VERSION"),
+            "architecture": std::env::consts::ARCH,
+        "gstreamer": gstreamer::version_string().to_string(),
+            "requiredFactories": required.len(), "decoders": decoders,
+            "networkConnections": 0, "hidReportsSent": 0
+        })
+    );
+    Ok(())
+}
+
 pub fn run() {
+    if let Err(error) = runtime_environment::configure() {
+        eprintln!("No se pudo preparar el motor multimedia: {error}");
+        std::process::exit(1);
+    }
+    if std::env::args().any(|argument| argument == "--check-runtime") {
+        if let Err(error) = check_runtime() {
+            eprintln!("Runtime: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         .setup(|app| {
             let window = app
@@ -651,10 +945,12 @@ pub fn run() {
                     state: "disconnected".into(),
                     phase: "idle".into(),
                     video_state: "waiting".into(),
+                    video_paused: false,
                     message: "Listo para conectar".into(),
                     address: "https://192.168.100.8/".into(),
                     capture: false,
                     capture_requested: false,
+                    input_enabled: true,
                     input_backend: String::new(),
                     decoder: String::new(),
                 }),
@@ -666,6 +962,7 @@ pub fn run() {
                 capture_lock: Mutex::new(()),
                 control_rtt: Mutex::new(None),
                 video_health: Mutex::new(health::FrameHealth::new(Instant::now())),
+                video_count_offset: Mutex::new((0, 0)),
                 source_notice: Mutex::new(None),
                 shutdown: AtomicU8::new(0),
             });
@@ -684,6 +981,7 @@ pub fn run() {
                         runtime.update(|s| {
                             s.capture = capture.active;
                             s.capture_requested = capture.requested;
+                            s.input_enabled = runtime.input().is_enabled();
                             s.input_backend = capture.backend;
                             s.message = capture.message;
                         });
@@ -707,6 +1005,7 @@ pub fn run() {
             video_host::show_placeholder();
             let weak = Arc::downgrade(&runtime);
             let layout_window = window.clone();
+            let previous_fullscreen = AtomicBool::new(window.is_fullscreen().unwrap_or(false));
             window.on_window_event(move |event| {
                 if let Some(runtime) = weak.upgrade() {
                     match event {
@@ -715,9 +1014,22 @@ pub fn run() {
                         }
                         tauri::WindowEvent::Resized(_) => {
                             if let Ok(fullscreen) = layout_window.is_fullscreen() {
+                                let was_fullscreen =
+                                    previous_fullscreen.swap(fullscreen, Ordering::AcqRel);
                                 let _ = layout_window.emit("kvm://fullscreen", fullscreen);
-                                let _ =
-                                    video_host::set_toolbar_visible(&layout_window, !fullscreen);
+                                if video_host::is_dashboard_fullscreen() {
+                                    if was_fullscreen && !fullscreen {
+                                        let _ = video_host::set_dashboard_fullscreen(
+                                            &layout_window,
+                                            false,
+                                        );
+                                    }
+                                } else {
+                                    let _ = video_host::set_toolbar_visible(
+                                        &layout_window,
+                                        !fullscreen,
+                                    );
+                                }
                             }
                         }
                         tauri::WindowEvent::CloseRequested { api, .. } => {
@@ -728,10 +1040,23 @@ pub fn run() {
                     }
                 }
             });
+            app.manage(sunshine::SunshineState::default());
+            app.manage(preferences::PreferenceState::default());
             app.manage(AppState(runtime));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            preferences::get_preferences,
+            preferences::save_preferences,
+            preferences::load_saved_password,
+            preferences::save_saved_password,
+            preferences::delete_saved_password,
+            sunshine::inspect_sunshine,
+            sunshine::pair_sunshine,
+            sunshine::get_sunshine_status,
+            sunshine::connect_sunshine,
+            sunshine::disconnect_sunshine,
+            sunshine::select_video_source,
             inspect_device,
             trust_device,
             connect_device,
@@ -739,8 +1064,12 @@ pub fn run() {
             get_status,
             set_input_settings,
             set_video_settings,
+            set_kvm_video_paused,
             set_capture,
-            set_fullscreen
+            set_kvm_input_enabled,
+            set_fullscreen,
+            set_dashboard_expanded,
+            set_dashboard_fullscreen
         ])
         .build(app_context())
         .expect("No se pudo iniciar KVM Client")

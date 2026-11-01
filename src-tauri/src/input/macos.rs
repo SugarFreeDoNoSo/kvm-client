@@ -10,7 +10,7 @@ use objc2_app_kit::{
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGError, CGEventSource, CGEventSourceStateID,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSTimer};
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
@@ -90,9 +90,23 @@ fn remove_capture(id: usize) {
     drop(previous);
 }
 
+// Return each missing release once; retain keys that remain physically held.
+fn take_released_keys(keys: &mut BTreeSet<u16>, mut is_down: impl FnMut(u16) -> bool) -> Vec<u16> {
+    let released: Vec<_> = keys
+        .iter()
+        .copied()
+        .filter(|code| !is_down(*code))
+        .collect();
+    for code in &released {
+        keys.remove(code);
+    }
+    released
+}
+
 struct Capture {
     window: Retained<NSWindow>,
     monitor: Option<Retained<AnyObject>>,
+    key_release_timer: Option<Retained<NSTimer>>,
     focus_observer: Option<Retained<AnyObject>>,
     old_mouse_moved: bool,
     old_coalescing: bool,
@@ -116,6 +130,7 @@ impl Capture {
             old_coalescing: NSEvent::isMouseCoalescingEnabled(),
             window: window.clone(),
             monitor: None,
+            key_release_timer: None,
             focus_observer: None,
             disconnected_cursor: false,
             hidden_cursor: false,
@@ -139,6 +154,37 @@ impl Capture {
         for usage in &modifiers.borrow().pressed {
             shared.key(*usage, true)?;
         }
+        // AppKit may omit keyUp for Command combinations. Track only those
+        // physical keys and recover missing releases without releasing held keys.
+        let command_keys = Arc::new(Mutex::new(BTreeSet::<u16>::new()));
+        let timer_keys = command_keys.clone();
+        let timer_shared = Arc::downgrade(shared);
+        let poll = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            let Some(shared) = timer_shared.upgrade().filter(|s| s.running(generation)) else {
+                return;
+            };
+            let released = {
+                let Ok(mut keys) = timer_keys.lock() else {
+                    return;
+                };
+                take_released_keys(&mut keys, |code| {
+                    CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, code)
+                })
+            };
+            for code in released {
+                if let Some(usage) = macos_to_hid(code) {
+                    if let Err(error) = shared.key(usage, false) {
+                        shared.stop_native(format!("Captura liberada: {error}"));
+                        break;
+                    }
+                }
+            }
+        });
+        // SAFETY: the block captures only Send + Sync state and is scheduled
+        // on the AppKit main run loop. Drop invalidates it on the same thread.
+        capture.key_release_timer = Some(unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.01, true, &poll)
+        });
         let weak = Arc::downgrade(shared);
         let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
             // SAFETY: AppKit keeps the NSEvent alive throughout this callback.
@@ -167,6 +213,22 @@ impl Capture {
             {
                 shared.stop_native("Control local; captura liberada con Ctrl+Option+Esc");
                 return ptr::null_mut();
+            }
+            if let Ok(mut keys) = command_keys.lock() {
+                match native_event.r#type() {
+                    NSEventType::KeyDown
+                        if native_event
+                            .modifierFlags()
+                            .contains(NSEventModifierFlags::Command)
+                            && !native_event.isARepeat() =>
+                    {
+                        keys.insert(native_event.keyCode());
+                    }
+                    NSEventType::KeyUp => {
+                        keys.remove(&native_event.keyCode());
+                    }
+                    _ => {}
+                }
             }
             let result = handle_event(&shared, native_event, &modifiers);
             match result {
@@ -222,6 +284,9 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        if let Some(timer) = self.key_release_timer.take() {
+            timer.invalidate();
+        }
         if let Some(observer) = self.focus_observer.take() {
             // SAFETY: this is the token returned by the notification center.
             unsafe {
@@ -854,5 +919,52 @@ mod tests {
         );
         assert_eq!(wheel_steps(-3.75, true), -0.25);
         assert_eq!(wheel_steps(1.0, false), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod command_release_tests {
+    use super::*;
+
+    #[test]
+    fn missing_command_keyup_is_recovered_once_without_releasing_held_keys() {
+        let mut keys = BTreeSet::from([0x09, 0x08]); // V and C
+        assert_eq!(
+            take_released_keys(&mut keys, |code| code == 0x08),
+            vec![0x09]
+        );
+        assert!(take_released_keys(&mut keys, |_| true).is_empty());
+        assert_eq!(take_released_keys(&mut keys, |_| false), vec![0x08]);
+        assert!(take_released_keys(&mut keys, |_| false).is_empty());
+    }
+
+    #[test]
+    fn command_v_missing_keyup_finishes_with_empty_keyboard_report() {
+        let mut scheduler = crate::input::scheduler::Scheduler::default();
+        scheduler.key(227, true).unwrap(); // left Command / Windows
+        scheduler.key(25, true).unwrap(); // V
+        scheduler.key(227, false).unwrap();
+        let mut keys = BTreeSet::from([0x09]);
+        for code in take_released_keys(&mut keys, |_| false) {
+            scheduler.key(macos_to_hid(code).unwrap(), false).unwrap();
+        }
+        let mut reports = Vec::new();
+        while let Some(report) = scheduler.peek() {
+            reports.push(report);
+            scheduler.acknowledge();
+        }
+        assert_eq!(reports.len(), 4);
+        assert_eq!(reports[1]["params"]["modifier"], 8);
+        assert_eq!(reports[1]["params"]["keys"], serde_json::json!([25]));
+        assert_eq!(reports[3]["params"]["modifier"], 0);
+        assert_eq!(reports[3]["params"]["keys"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn normal_keyup_removes_key_before_fallback_poll() {
+        let mut keys = BTreeSet::from([0x09]);
+        keys.remove(&0x09);
+        assert!(take_released_keys(&mut keys, |_| false).is_empty());
+        assert_eq!(macos_to_hid(0x09), Some(25));
     }
 }

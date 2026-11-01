@@ -9,9 +9,9 @@ la respuesta SDP y los candidatos entrantes se entregan a `handle_answer` y `add
 La recepción utiliza:
 
 ```
-webrtcbin → queue → rtph264depay → h264parse → decoder
+webrtcbin → queue → valve → rtph264depay → h264parse → decoder
           → queue (un cuadro, leaky downstream)
-          → glupload → glcolorconvert → glshader → sink nativo
+          → glupload → glcolorconvert → glshader → caps de destino → sink nativo
 ```
 
 No se descartan paquetes RTP deliberadamente. La cola limitada descarta cuadros
@@ -25,10 +25,46 @@ En Linux se buscan decodificadores VA, VAAPI, NVIDIA y V4L2; en macOS se prefier
 software conservando el receptor RTP y la superficie nativa. El nombre real se
 publica mediante el evento `Decoder`.
 
-El filtro inicial conserva la interpolación espacial bilineal de la textura.
-La opción de nitidez aplica una máscara espacial de cinco muestras, limitada al
-rango local para reducir halos; no genera cuadros ni conserva cuadros anteriores.
-Los filtros se ejecutan en la GPU y no pasan imágenes por JavaScript.
+Los perfiles se ejecutan en la GPU, sin transportar fotogramas por JavaScript:
+
+| Perfil | Procesamiento |
+| --- | --- |
+| Original | Interpolación bilineal, sin enfoque, para comparación. |
+| Escritorio | Bicúbico con control de halos y nitidez opcional. |
+| Juegos 3D | SGSR v1 espacial, con intensidad ajustable. |
+| Píxeles | Muestreo del centro de cada texel, sin interpolación. |
+
+**Ajustar** conserva la relación de aspecto y negocia la resolución del filtro
+al tamaño físico del área de video. AppKit convierte puntos a píxeles de backing;
+GTK usa asignación por factor de escala. Las caps después de `glshader` fijan el
+tamaño de su salida: el visor no recibe un filtro todavía limitado a la resolución
+de entrada para ampliarlo después. Los uniforms distinguen dimensiones recibidas
+y de salida; los cambios de tamaño y pantalla actualizan esa negociación.
+
+**1:1** centra cada píxel recibido en un píxel físico. Añade márgenes negros si
+cabe y recorta por el centro si la imagen es mayor que el área disponible. El
+shader genera el lienzo completo de destino para evitar que el visor amplíe
+otra vez la imagen. **2×**, **3×** y **4×** usan el mismo lienzo con ampliación
+entera y recorte centrado. En Píxeles, cada texel se replica sin mezclar vecinos.
+Estas escalas funcionan con PicoKVM y Sunshine.
+
+Los ajustes avanzados se guardan con el perfil: control de halos de 0 a 100 %
+en Escritorio y umbral de bordes de 1 a 32 (normalizado a 1/255–32/255) en
+Juegos 3D. El umbral bajo detecta más variaciones; el alto restringe la
+reconstrucción a contrastes más fuertes. La nitidez de 0 a 100 % sigue separada.
+
+Al reducir con Ajustar, Escritorio y Juegos 3D pueden promediar la huella del
+píxel de destino para reducir aliasing y parpadeo. En esta ruta no se aplica
+enfoque adicional ni reconstrucción SGSR. El muestreo se limita a 8×8 por píxel
+para acotar el coste; reducciones mayores de 8:1 son aproximadas. Original
+conserva la referencia bilineal. El suavizado no cambia las escalas manuales.
+
+SGSR v1 se adapta de la referencia de Qualcomm, con atribución y licencia en
+`src-tauri/src/shaders/THIRD_PARTY_NOTICES.md`. En Juegos 3D, 0 % conserva la reconstrucción con la intensidad mínima de SGSR;
+Original permite comparar sin ella. No es un filtro temporal ni genera
+fotogramas. MetalFX requeriría una ruta Metal adicional; DLSS no está implementado
+como filtro local. Mejorar la presentación no aumenta los FPS del juego remoto.
+
 El filtro proporciona etapas de vértices y fragmentos compatibles entre sí;
 dejar que GStreamer genere solo la etapa de vértices puede mezclar versiones GLSL
 cuando la ventana comparte el contexto OpenGL con WebKit. Al cambiar los shaders,
@@ -36,7 +72,8 @@ validar también un contexto OpenGL 3 de Mesa, además de la GPU física.
 
 ## AppKit y OpenGL en macOS
 
-El webview conserva la consola superior de 260 puntos. Un `NSView` nativo ocupa el
+El webview ocupa un panel lateral izquierdo de 360 puntos, o cero cuando está
+oculto. Puede ampliarse a pantalla completa del sistema. Un `NSView` nativo ocupa el
 resto de la ventana, con Auto Layout para redimensionado y pantalla completa.
 `GstVideoOverlay` entrega ese host a `glimagesinkelement`, el sink GL interno de
 `glimagesink`. El host retiene la vista hasta detener el pipeline; AppKit se
@@ -68,6 +105,11 @@ lleva el pipeline a `NULL`; debe llamarse antes de soltar el motor.
 - RTT y paquetes perdidos: estadísticas reales de `webrtcbin`; cuando no hay RTT
   disponible se mide un `ping` JSON-RPC cada dos segundos. Ese respaldo incluye el
   procesamiento del servidor. La ausencia de datos se representa como `null`.
+- El tiempo del filtro mide la duración de pared entre sus pads de entrada y
+  salida, incluidas esperas; no es un temporizador GPU ni latencia extremo a extremo.
+- Los descartes publicados corresponden al sink, no incluyen necesariamente los
+  de la cola anterior al shader. No se interpreta la diferencia entre FPS como
+  una medición exacta de pérdidas.
 - La latencia extremo a extremo solo se valida con medición visual externa.
 
 `send_rpc` rechaza tráfico cuando el buffer SCTP supera 32 KiB. El planificador
@@ -113,9 +155,9 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin kvm-smoke -- \
 Este modo requiere `capssetter` y un codificador `openh264enc` o `x264enc`.
 Genera una escena local, la codifica en H.264 y
 la transmite entre dos pares WebRTC reales con ICE/DTLS/SRTP y un DataChannel.
-El receptor es el mismo `MediaEngine` de la aplicación. A mitad de la prueba se
-activa la nitidez espacial y se verifica que la decodificación y la presentación
-siguen activas. Aprobar esta prueba no sustituye la prueba con HDMI del equipo.
+El receptor es el mismo `MediaEngine` de la aplicación. La prueba recorre Original, Escritorio y Juegos 3D; con al menos cuatro segundos
+añade Escritorio 1:1, Píxeles y Píxeles 2×. Verifica dimensiones negociadas y cuadros nuevos en cada
+fase y publica el coste observado del filtro. Aprobar esta prueba no sustituye la prueba con HDMI del equipo.
 
 El emisor sintético normaliza las caps de perfiles Constrained Baseline
 equivalentes después de comprobar su SPS real. Esto evita el rechazo de video
@@ -134,3 +176,12 @@ KVM_FORCE_SOFTWARE=1 cargo run --manifest-path src-tauri/Cargo.toml --bin kvm-sm
 El acceso al display y a la GPU debe estar disponible para esa ejecución. Un
 entorno aislado sin acceso gráfico puede fallar con `EGL_NOT_INITIALIZED` aunque
 las dependencias estén instaladas.
+
+## Pausa local de PicoKVM
+
+Una válvula antes del depayload descarta los buffers de video mientras está pausado,
+conservando eventos de negociación y el peer WebRTC con su DataChannel. El decodificador
+y la presentación dejan de recibir cuadros nuevos; pueden drenarse cuadros ya encolados.
+Al reanudar se solicita un fotograma clave y FrameHealth espera contadores nuevos,
+sin reutilizar los acumulados anteriores como si fueran video fresco. La recepción de
+red y el codificador remoto continúan. El receptor Sunshine es independiente y no se pausa.

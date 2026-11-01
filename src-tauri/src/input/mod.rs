@@ -36,6 +36,8 @@ pub type RpcSender = Arc<dyn Fn(Value) -> Result<(), String> + Send + Sync>;
 pub type CaptureCallback = Arc<dyn Fn(CaptureStatus) + Send + Sync>;
 #[cfg(target_os = "macos")]
 type NativeDispatch = Arc<dyn Fn(bool, u64) -> Result<(), String> + Send + Sync>;
+const INPUT_DISABLED_MESSAGE: &str =
+    "El mouse y teclado del KVM están desactivados; habilítalos antes de capturar";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CaptureStatus {
@@ -59,6 +61,7 @@ pub(super) struct Shared {
     send: RpcSender,
     callback: CaptureCallback,
     generation: AtomicU64,
+    enabled: AtomicBool,
     requested: AtomicBool,
     active: AtomicBool,
     stats: Mutex<InputStats>,
@@ -68,46 +71,60 @@ pub(super) struct Shared {
 
 impl Shared {
     pub(super) fn running(&self, generation: u64) -> bool {
-        self.requested.load(Ordering::Acquire)
+        self.enabled.load(Ordering::Acquire)
+            && self.requested.load(Ordering::Acquire)
             && self.generation.load(Ordering::Acquire) == generation
     }
 
     pub(super) fn report(&self, active: bool, backend: &str, message: impl Into<String>) {
+        // Publish capture transitions under the same lock as HID enablement. A
+        // delayed native activation must not overtake the disabled notification.
+        let _scheduler = self.scheduler.lock().unwrap_or_else(|e| e.into_inner());
+        let requested =
+            self.enabled.load(Ordering::Acquire) && self.requested.load(Ordering::Acquire);
+        if active && !requested {
+            return;
+        }
         self.active.store(active, Ordering::Release);
         (self.callback)(CaptureStatus {
             active,
-            requested: self.requested.load(Ordering::Acquire),
+            requested,
             backend: backend.into(),
             message: message.into(),
         });
     }
 
     pub(super) fn motion(&self, dx: f64, dy: f64) -> Result<(), String> {
-        self.scheduler
-            .lock()
-            .map_err(|e| e.to_string())?
-            .motion(dx, dy)
+        let mut scheduler = self.scheduler.lock().map_err(|e| e.to_string())?;
+        if self.enabled.load(Ordering::Acquire) {
+            scheduler.motion(dx, dy)?;
+        }
+        Ok(())
     }
 
     pub(super) fn button(&self, bit: u8, pressed: bool) -> Result<(), String> {
-        self.scheduler
-            .lock()
-            .map_err(|e| e.to_string())?
-            .button(bit, pressed)
+        let mut scheduler = self.scheduler.lock().map_err(|e| e.to_string())?;
+        if self.enabled.load(Ordering::Acquire) {
+            scheduler.button(bit, pressed)?;
+        }
+        Ok(())
     }
 
     pub(super) fn wheel(&self, steps: f64) -> Result<(), String> {
-        self.scheduler
-            .lock()
-            .map_err(|e| e.to_string())?
-            .wheel(steps)
+        let mut scheduler = self.scheduler.lock().map_err(|e| e.to_string())?;
+        if self.enabled.load(Ordering::Acquire) {
+            scheduler.wheel(steps)?;
+        }
+        Ok(())
     }
 
     pub(super) fn key(&self, usage: u8, pressed: bool) -> Result<bool, String> {
-        self.scheduler
-            .lock()
-            .map_err(|e| e.to_string())?
-            .key(usage, pressed)
+        let mut scheduler = self.scheduler.lock().map_err(|e| e.to_string())?;
+        if self.enabled.load(Ordering::Acquire) {
+            scheduler.key(usage, pressed)
+        } else {
+            Ok(false)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -163,6 +180,7 @@ impl InputEngine {
             send,
             callback,
             generation: AtomicU64::new(0),
+            enabled: AtomicBool::new(true),
             requested: AtomicBool::new(false),
             active: AtomicBool::new(false),
             stats: Mutex::new(InputStats {
@@ -176,7 +194,8 @@ impl InputEngine {
         thread::Builder::new()
             .name("kvm-hid-scheduler".into())
             .spawn(move || {
-                let mut next = Instant::now();
+                let input_clock = Instant::now();
+                let mut next = input_clock;
                 let mut sample = Instant::now();
                 let mut reports = 0u32;
                 let mut failures = 0u32;
@@ -194,10 +213,13 @@ impl InputEngine {
                     let hz = scheduler.settings.hz;
                     let mut congested = false;
                     // At most one HID report per tick: even a large delta stays paced.
-                    if let Some(report) = scheduler.peek() {
+                    // Keep report selection stable if the keyboard deadline
+                    // passes between peeking and acknowledging a mouse report.
+                    let report_time = input_clock.elapsed();
+                    if let Some(report) = scheduler.peek_at(report_time) {
                         match (shared.send)(report) {
                             Ok(()) => {
-                                scheduler.acknowledge();
+                                scheduler.acknowledge_at(report_time);
                                 reports += 1;
                                 successes += 1;
                                 failures = 0;
@@ -307,10 +329,45 @@ impl InputEngine {
     }
 
     pub fn is_captured(&self) -> bool {
-        self.shared.active.load(Ordering::Acquire)
+        self.is_enabled() && self.is_requested() && self.shared.active.load(Ordering::Acquire)
     }
     pub fn is_requested(&self) -> bool {
         self.shared.requested.load(Ordering::Acquire)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.shared.enabled.load(Ordering::Acquire)
+    }
+
+    /// Disable HID independently of the media transport. The scheduler lock also
+    /// gates native callbacks already in flight when capture is cancelled.
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        let generation = {
+            let mut scheduler = self.shared.scheduler.lock().map_err(|e| e.to_string())?;
+            if self.shared.enabled.swap(enabled, Ordering::AcqRel) == enabled {
+                return Ok(());
+            }
+            if enabled {
+                return Ok(());
+            }
+            self.shared.requested.store(false, Ordering::Release);
+            let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            scheduler.release();
+            self.send_pending_releases(&mut scheduler);
+            generation
+        };
+        self.shared.report(
+            false,
+            "",
+            "Mouse y teclado del KVM desactivados; control local",
+        );
+        #[cfg(target_os = "macos")]
+        return self.shared.dispatch_native(false, generation);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = generation;
+            Ok(())
+        }
     }
 
     pub fn capture(&self, enabled: bool) -> Result<(), String> {
@@ -329,10 +386,16 @@ impl InputEngine {
             #[cfg(not(target_os = "macos"))]
             return Ok(());
         }
-        if self.shared.requested.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = {
+            let _scheduler = self.shared.scheduler.lock().map_err(|e| e.to_string())?;
+            if !self.is_enabled() {
+                return Err(INPUT_DISABLED_MESSAGE.into());
+            }
+            if self.shared.requested.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
         #[cfg(target_os = "macos")]
         {
             self.shared
@@ -417,6 +480,10 @@ impl InputEngine {
             return;
         };
         scheduler.release();
+        self.send_pending_releases(&mut scheduler);
+    }
+
+    fn send_pending_releases(&self, scheduler: &mut Scheduler) {
         for _ in 0..2 {
             let Some(report) = scheduler.peek() else {
                 break;
@@ -441,5 +508,188 @@ impl Drop for InputEngine {
         let _ = self.shared.dispatch_native(false, generation);
         #[cfg(not(target_os = "macos"))]
         let _ = generation;
+    }
+}
+
+#[cfg(test)]
+mod enabled_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn isolated_engine(reports: Arc<Mutex<Vec<Value>>>) -> InputEngine {
+        InputEngine {
+            shared: Arc::new(Shared {
+                scheduler: Mutex::new(Scheduler::default()),
+                send: Arc::new(move |report| {
+                    reports.lock().unwrap().push(report);
+                    Ok(())
+                }),
+                callback: Arc::new(|_| {}),
+                generation: AtomicU64::new(0),
+                enabled: AtomicBool::new(true),
+                requested: AtomicBool::new(false),
+                active: AtomicBool::new(false),
+                stats: Mutex::new(InputStats::default()),
+                #[cfg(target_os = "macos")]
+                native_dispatch: Mutex::new(None),
+            }),
+            owners: Arc::new(()),
+        }
+    }
+
+    fn assert_release_reports(reports: &[Value]) {
+        assert_eq!(reports.len(), 2, "one mouse and one keyboard release");
+        assert_eq!(reports[0]["method"], "relMouseReport");
+        assert_eq!(
+            reports[0]["params"],
+            json!({"dx": 0, "dy": 0, "buttons": 0})
+        );
+        assert_eq!(reports[1]["method"], "keyboardReport");
+        assert_eq!(reports[1]["params"], json!({"keys": [], "modifier": 0}));
+    }
+
+    #[test]
+    fn disabling_releases_held_input_and_discards_all_late_native_events() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let engine = isolated_engine(reports.clone());
+        engine.shared.requested.store(true, Ordering::Release);
+        engine.shared.active.store(true, Ordering::Release);
+        let generation = engine.shared.generation.load(Ordering::Acquire);
+        engine.shared.key(4, true).unwrap();
+        engine.shared.key(225, true).unwrap();
+        engine.shared.button(1, true).unwrap();
+        {
+            let mut scheduler = engine.shared.scheduler.lock().unwrap();
+            while let Some(report) = scheduler.peek() {
+                (engine.shared.send)(report).unwrap();
+                scheduler.acknowledge();
+            }
+        }
+        reports.lock().unwrap().clear();
+        engine.shared.motion(500.75, -90.25).unwrap();
+        engine.shared.wheel(3.5).unwrap();
+        engine.shared.key(5, true).unwrap();
+
+        engine.set_enabled(false).unwrap();
+        assert!(!engine.is_enabled());
+        assert!(!engine.is_requested());
+        assert!(!engine.is_captured());
+        assert!(!engine.shared.running(generation));
+        assert_release_reports(&reports.lock().unwrap());
+
+        engine.shared.motion(100.0, 20.0).unwrap();
+        engine.shared.button(1, true).unwrap();
+        engine.shared.wheel(4.0).unwrap();
+        assert!(!engine.shared.key(6, true).unwrap());
+        assert_eq!(engine.shared.scheduler.lock().unwrap().len(), 0);
+        assert_release_reports(&reports.lock().unwrap());
+    }
+
+    #[test]
+    fn disabled_capture_is_rejected_and_enabling_requires_a_new_capture() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let engine = isolated_engine(reports);
+        engine.shared.motion(0.75, 0.75).unwrap();
+        engine.shared.wheel(0.75).unwrap();
+        engine.set_enabled(false).unwrap();
+        assert_eq!(engine.capture(true).unwrap_err(), INPUT_DISABLED_MESSAGE);
+        engine.shared.motion(100.0, 100.0).unwrap();
+        engine.set_enabled(true).unwrap();
+        assert!(engine.is_enabled());
+        assert!(!engine.is_requested());
+        assert!(!engine.is_captured());
+        assert_eq!(engine.shared.scheduler.lock().unwrap().len(), 0);
+        engine.shared.motion(0.5, 0.5).unwrap();
+        engine.shared.wheel(0.5).unwrap();
+        assert_eq!(engine.shared.scheduler.lock().unwrap().len(), 0);
+        engine.shared.motion(0.5, 0.5).unwrap();
+        let scheduler = engine.shared.scheduler.lock().unwrap();
+        let report = scheduler.peek().unwrap();
+        assert_eq!(report["params"], json!({"dx": 1, "dy": 1, "buttons": 0}));
+    }
+
+    #[test]
+    fn stale_native_activation_is_ignored_while_disabled_and_after_reenabling() {
+        let mut engine = isolated_engine(Arc::new(Mutex::new(Vec::new())));
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let capture_statuses = statuses.clone();
+        Arc::get_mut(&mut engine.shared).unwrap().callback = Arc::new(move |status| {
+            capture_statuses.lock().unwrap().push(status);
+        });
+        engine.shared.requested.store(true, Ordering::Release);
+        engine.set_enabled(false).unwrap();
+        engine.shared.report(true, "stale capture", "captured");
+        engine.set_enabled(true).unwrap();
+        engine.shared.report(true, "stale capture", "captured");
+        assert!(!engine.is_captured());
+        assert!(!engine.is_requested());
+        let statuses = statuses.lock().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].active);
+        assert!(!statuses[0].requested);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn disabling_cancels_native_capture_and_invalidates_its_generation() {
+        let engine = isolated_engine(Arc::new(Mutex::new(Vec::new())));
+        let stops = Arc::new(AtomicU64::new(0));
+        let native_stops = stops.clone();
+        let weak = Arc::downgrade(&engine.shared);
+        *engine.shared.native_dispatch.lock().unwrap() =
+            Some(Arc::new(move |enabled, generation| {
+                let shared = weak.upgrade().ok_or("input engine dropped")?;
+                if enabled && shared.running(generation) {
+                    shared.report(true, "simulated AppKit", "captured");
+                } else if !enabled {
+                    native_stops.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }));
+        engine.capture(true).unwrap();
+        let generation = engine.shared.generation.load(Ordering::Acquire);
+        assert!(engine.is_captured());
+        engine.set_enabled(false).unwrap();
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(!engine.shared.running(generation));
+        assert!(!engine.is_captured());
+        engine.set_enabled(true).unwrap();
+        assert!(!engine.is_requested());
+        assert!(!engine.is_captured());
+    }
+
+    #[test]
+    fn disabled_release_retries_only_zero_hid_reports_when_transport_recovers() {
+        let available = Arc::new(AtomicBool::new(false));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let send_available = available.clone();
+        let send_reports = reports.clone();
+        let engine = InputEngine::new(
+            Arc::new(move |report| {
+                if !send_available.load(Ordering::Acquire) {
+                    return Err("temporarily unavailable".into());
+                }
+                send_reports.lock().unwrap().push(report);
+                Ok(())
+            }),
+            Arc::new(|_| {}),
+        );
+        engine.shared.key(225, true).unwrap();
+        engine.shared.button(1, true).unwrap();
+        engine.shared.motion(1000.0, -1000.0).unwrap();
+        engine.set_enabled(false).unwrap();
+        assert_eq!(engine.shared.scheduler.lock().unwrap().len(), 2);
+        engine.shared.motion(50.0, 50.0).unwrap();
+        engine.shared.wheel(2.0).unwrap();
+        engine.shared.key(4, true).unwrap();
+        available.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.shared.scheduler.lock().unwrap().len() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(engine.shared.scheduler.lock().unwrap().len(), 0);
+        assert_release_reports(&reports.lock().unwrap());
+        assert!(!engine.is_enabled());
+        assert!(!engine.is_captured());
     }
 }

@@ -88,7 +88,23 @@ distribución de teclado.
 
 ## Pruebas
 
+**Desactivar teclado y mouse KVM** bloquea los eventos de este cliente bajo el
+mismo mutex del planificador: cancela la captura nativa, invalida callbacks,
+descarta la cola y prioriza reportes de liberación. Si falla el transporte,
+conserva esas liberaciones para reintento. Video, audio y el canal WebRTC siguen
+activos. Reactivar permite una captura manual nueva sin reproducir entradas
+anteriores. La selección se conserva entre reconexiones de la aplicación,
+pero no se guarda al cerrarla. No desconecta el dispositivo USB remoto.
+
 Las pruebas unitarias del planificador verifican división de movimientos grandes,
 fracciones negativas, orden de arrastre/clic/rueda, reintento sin consumo de deltas,
 límite de cola y prioridad de la liberación. Las pruebas físicas de captura y la
 tasa USB requieren una sesión gráfica y un KVM conectados.
+
+## Ritmo del teclado
+
+El teclado conserva cada cambio de estado en la cola nativa y separa los envíos aceptados al menos 20 ms (máximo 50 reportes/s), independientemente de los Hz del mouse. Es un valor conservador inicial, no una capacidad medida del firmware. Las repeticiones de una tecla ya pulsada no generan reportes adicionales; la repetición se produce en el equipo remoto mientras la tecla permanece pulsada.
+
+Los fallos de transporte mantienen el reporte pendiente. Durante la espera del teclado, el movimiento relativo puede adelantarse a las teclas pendientes para evitar pausas al mover la cámara. El teclado conserva su orden y los botones y la rueda actúan como barreras: ningún movimiento los adelanta. Esto permite que el movimiento llegue antes que una transición pendiente de tecla o modificador. La cancelación elimina las entradas pendientes y prioriza liberar teclas y botones; el vaciado final al cerrar puede omitir el intervalo por seguridad.
+
+En macOS, las teclas usadas con Command (Windows en el equipo remoto) se comprueban además contra su estado físico cada 10 ms durante la captura. Si AppKit omite un `KeyUp`, se encola la liberación al detectar que la tecla ya está suelta. No se libera una tecla físicamente mantenida; el temporizador se invalida al terminar la captura.

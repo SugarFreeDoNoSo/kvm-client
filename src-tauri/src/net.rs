@@ -126,6 +126,32 @@ pub fn tls_config(pin: Option<String>) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+/// Sunshine authenticates with a client certificate and pins the server
+/// certificate authenticated by the PIN pairing exchange.
+pub fn sunshine_tls_config(
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+    server: &[u8],
+) -> Result<ClientConfig, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CertificateVerifier {
+            pin: Some(fingerprint(server)),
+        }))
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(certificate)],
+            rustls::pki_types::PrivateKeyDer::try_from(key).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    // Sunshine authenticates each connection using its client-certificate
+    // handshake. A resumed TLS session can skip that handshake.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
+}
+
 pub async fn probe_certificate(url: &Url) -> Result<String, String> {
     let host = url.host_str().ok_or("Falta el host")?.to_owned();
     let port = url.port_or_known_default().unwrap_or(443);

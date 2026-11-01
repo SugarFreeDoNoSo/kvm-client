@@ -5,7 +5,7 @@ failed=0
 printf 'Plataforma: %s (%s)\n' "$KVM_HOST_OS" "$(uname -m)"
 case "$KVM_HOST_OS" in
   Darwin) libraries=(gstreamer-1.0 gstreamer-video-1.0 gstreamer-gl-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0); sinks=(glimagesinkelement); decoders=(vtdec_hw vtdec avdec_h264 openh264dec) ;;
-  Linux) libraries=(gtk+-3.0 webkit2gtk-4.1 gstreamer-1.0 gstreamer-video-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libei-1.0); sinks=(gtkglsink); decoders=(vah264dec vaapih264dec nvh264dec v4l2slh264dec avdec_h264 openh264dec) ;;
+  Linux) libraries=(gtk+-3.0 webkit2gtk-4.1 gstreamer-1.0 gstreamer-video-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libei-1.0 dbus-1); sinks=(gtkglsink); decoders=(vah264dec vaapih264dec nvh264dec v4l2slh264dec avdec_h264 openh264dec) ;;
   *) printf 'Plataforma no compatible: %s\n' "$KVM_HOST_OS" >&2; exit 1 ;;
 esac
 for tool in cargo rustc node npm pkg-config gst-inspect-1.0; do
